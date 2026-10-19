@@ -12,6 +12,7 @@ the paper's complete WeatherBench2 protocol (dates, aggregation and grid).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 import json
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,88 @@ import numpy as np
 import xarray as xr
 
 from .data import _require_time, make_training_window, output_timedelta, validate_coordinates
+
+
+def complete_forecast_starts(
+    model: Any, dataset: xr.Dataset, forecast_steps: int,
+    output_interval: Any = "6h", *, stride: int = 1,
+) -> list[int]:
+    """Find complete horizons and reject missing valid times before computation.
+
+    The stride counts dataset samples. Every requested lead must be present;
+    gaps inside a candidate horizon are errors rather than silently skipped cases.
+    Only the time coordinate is read, so this preflight is cheap for large ERA5.
+    """
+    if isinstance(stride, bool) or not isinstance(stride, (int, np.integer)) or stride < 1:
+        raise ValueError("stride must be a positive integer")
+    if isinstance(forecast_steps, bool) or not isinstance(forecast_steps, (int, np.integer)) or forecast_steps < 1:
+        raise ValueError("forecast_steps must be a positive integer")
+    times = _require_time(dataset)
+    interval = output_timedelta(model, output_interval)
+    candidates = np.arange(0, len(times), stride)
+    starts = candidates[times[candidates] + forecast_steps * interval <= times[-1]]
+    if not starts.size:
+        raise ValueError("dataset contains no complete forecast window")
+    for lead in range(1, forecast_steps + 1):
+        desired = times[starts] + lead * interval
+        positions = np.searchsorted(times, desired)
+        if not np.array_equal(times[positions], desired):
+            raise ValueError("dataset is missing exact forecast target times inside a complete horizon")
+    return starts.tolist()
+
+
+def normalized_forecast_mse(
+    metrics: xr.Dataset, variable_scales: Mapping[str, float], *,
+    expected_initialization_count: int | None = None,
+) -> float:
+    """Recover the training rollout MSE from pooled native-grid RMSE metrics.
+
+    Use the *training-derived* scale for each decoded input variable. Squaring
+    pooled RMSE recovers mean initialization MSE; lead times and pressure levels
+    are averaged within each variable, followed by an equal variable average.
+    Derived wind-vector/native benchmark metrics and ACC do not enter selection.
+    Incomplete or nonfinite aggregates are rejected rather than rewarded.
+    """
+    base_metrics = {name[:-5]: name for name in metrics.data_vars
+                    if name.endswith("_rmse") and name != "wind_vector_rmse"
+                    and not name.startswith("native_")}
+    if not variable_scales or set(variable_scales) != set(base_metrics):
+        raise ValueError("Scale names must match every decoded-variable RMSE exactly")
+    if expected_initialization_count is None:
+        expected_initialization_count = metrics.attrs.get("initialization_count")
+    if expected_initialization_count is not None and (
+        isinstance(expected_initialization_count, bool)
+        or not isinstance(expected_initialization_count, (int, np.integer))
+        or expected_initialization_count < 1
+    ):
+        raise ValueError("expected_initialization_count must be a positive integer")
+    field_scores = []
+    for variable, name in base_metrics.items():
+        try:
+            scale = np.asarray(variable_scales[variable], dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Scale for {variable} must be a finite positive scalar") from exc
+        if scale.ndim != 0 or not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"Scale for {variable} must be a finite positive scalar")
+        field = metrics[name]
+        if set(field.dims) != {"lead_time", "level"} or not field.size:
+            raise ValueError(f"{name} requires nonempty lead_time and level dimensions")
+        values = np.asarray(field.values, dtype=np.float64)
+        if not np.isfinite(values).all() or np.any(values < 0):
+            raise ValueError(f"{name} must contain finite nonnegative RMSE values")
+        if expected_initialization_count is not None:
+            count_name = f"{name}_initialization_count"
+            if count_name not in metrics:
+                raise ValueError(f"missing initialization counts for {name}")
+            counts = metrics[count_name]
+            if (counts.dims != field.dims or counts.shape != field.shape
+                    or not np.all(counts.values == expected_initialization_count)):
+                raise ValueError(f"incomplete initialization counts for {name}")
+        field_scores.append(float(np.mean(np.square(values / float(scale)))))
+    score = float(np.mean(field_scores))
+    if not np.isfinite(score):
+        raise ValueError("normalized forecast MSE must be finite")
+    return score
 
 
 def quadrature_weights(horizontal_grid: Any) -> np.ndarray:
@@ -238,15 +321,9 @@ def evaluate_many(
     is reused; a time-indexed climatology is selected at each window's valid times.
     Forecast storage is optional because full ERA5-sized trajectories are large.
     """
-    if isinstance(stride, bool) or not isinstance(stride, (int, np.integer)) or stride < 1:
-        raise ValueError("stride must be a positive integer")
-    if isinstance(forecast_steps, bool) or not isinstance(forecast_steps, (int, np.integer)) or forecast_steps < 1:
-        raise ValueError("forecast_steps must be a positive integer")
     times = _require_time(dataset)
     interval = output_timedelta(model, output_interval)
-    starts = [i for i in range(0, len(times), stride) if times[i] + forecast_steps * interval <= times[-1]]
-    if not starts:
-        raise ValueError("dataset contains no complete forecast window")
+    starts = complete_forecast_starts(model, dataset, forecast_steps, interval, stride=stride)
     totals, counts, forecasts, initializations = {}, {}, [], []
     template, metadata = None, None
     for start in starts:
