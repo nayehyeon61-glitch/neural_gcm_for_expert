@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import jax
 import numpy as np
-import pandas as pd
 from neuralgcm import PressureLevelModel
 
 
@@ -69,26 +68,40 @@ def evaluate_command(args):
 def train(args):
     from neuralgcm_expert.model import load_checkpoint, save_checkpoint, restore_checkpoint
     from neuralgcm_expert import mappings
-    from neuralgcm_expert.data import open_dataset, make_training_window
-    from neuralgcm_expert.evaluation import evaluate, quadrature_weights
+    from neuralgcm_expert.data import open_dataset, make_training_window, _require_time, output_timedelta
+    from neuralgcm_expert.evaluation import (
+        complete_forecast_starts, evaluate_many, normalized_forecast_mse, quadrature_weights)
     from neuralgcm_expert.training import (
         LossConfig, estimate_scales, make_train_step, prepare_native_targets,
         window_batch, with_params, trainable_mask)
     del mappings
-    if args.epochs < 1 or args.stride < 1:
-        raise ValueError('epochs and stride must be positive')
+    if args.epochs < 1 or args.stride < 1 or args.validation_stride < 1:
+        raise ValueError('epochs, stride and validation-stride must be positive')
+    validation_steps = args.steps if args.validation_steps is None else args.validation_steps
+    if args.steps < 1 or validation_steps < 1:
+        raise ValueError('steps and validation-steps must be positive')
     checkpoint = load_checkpoint(args.checkpoint)
     model = restore_checkpoint(checkpoint)
     ds = open_dataset(args.train_data)
     valid = open_dataset(args.validation_data) if args.validation_data else None
+    times = _require_time(ds)
+    interval = output_timedelta(model, args.interval)
+    horizon = max(args.steps, 2 if (args.tendency_weight or args.acceleration_weight) else 1)
+    indices = complete_forecast_starts(model, ds, horizon, interval, stride=args.stride)
+    validation_indices = None
     if valid is not None:
+        valid_times = _require_time(valid)
         # All overlapping time ranges are rejected, not merely identical samples.
-        if not (ds.time.values[-1] < valid.time.values[0]
-                or valid.time.values[-1] < ds.time.values[0]):
+        if not (times[-1] < valid_times[0] or valid_times[-1] < times[0]):
             raise ValueError('Training and validation time ranges overlap')
+        validation_indices = complete_forecast_starts(
+            model, valid, validation_steps, interval, stride=args.validation_stride)
     variable_scales = _json(args.scales) or estimate_scales(ds, model.input_variables)
     if set(variable_scales) != set(model.input_variables):
         raise ValueError('Scale file must contain exactly model.input_variables')
+    if any(np.ndim(value) != 0 or not np.isfinite(value) or value <= 0
+           for value in variable_scales.values()):
+        raise ValueError('Scale file must contain finite positive scalar values')
     native_scales = _json(args.native_scales)
     config = LossConfig(tendency_weight=args.tendency_weight,
                         acceleration_weight=args.acceleration_weight,
@@ -103,15 +116,6 @@ def train(args):
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output/'scales.json', variable_scales)
     _write_json(output/'run.json', {k: v for k, v in vars(args).items() if k != 'func'})
-    times = ds.time.values
-    interval = np.timedelta64(pd.Timedelta(args.interval).value, 'ns')
-    if interval <= np.timedelta64(0, 'ns'):
-        raise ValueError('interval must be positive')
-    horizon = max(args.steps, 2 if (args.tendency_weight or args.acceleration_weight) else 1)
-    indices = [i for i in range(0, len(times), args.stride)
-               if times[i] + horizon*interval <= times[-1]]
-    if not indices:
-        raise ValueError('No complete training windows for the requested forecast horizon')
     rng = np.random.default_rng(args.seed)
     params = model.params
     mask = trainable_mask(params, args.scope)
@@ -119,6 +123,7 @@ def train(args):
         jax.tree_util.tree_leaves(params), jax.tree_util.tree_leaves(mask)) if enabled)
     native_reference = model  # fixed encoder targets, even if --scope all is used
     best_validation = float('inf')
+    best_epoch = None
     with (output/'training.jsonl').open('w') as log:
         for epoch in range(args.epochs):
             order = rng.permutation(indices)
@@ -155,28 +160,38 @@ def train(args):
                 'note': 'Training executed; forecast skill and long-term stability are not certified.'})
             save_checkpoint(model, output/'last.pkl', checkpoint)
             if valid is not None:
-                result = evaluate(model, valid, forecast_steps=args.steps,
-                                  output_interval=args.interval, forcing_mode=args.forcing_mode)
+                result = evaluate_many(
+                    model, valid, forecast_steps=validation_steps,
+                    output_interval=args.interval, forcing_mode=args.forcing_mode,
+                    stride=args.validation_stride, store_predictions=False)
                 result.save(output/f'validation-epoch-{epoch+1}')
-                # Checkpoint selection uses the same dimensionless rollout MSE,
-                # avoiding averaging RMSE with incompatible physical units.
-                window = make_training_window(model, valid, args.steps,
-                                               output_interval=args.interval,
-                                               forcing_mode=args.forcing_mode)
-                from neuralgcm_expert.losses import weighted_mse
-                pred = model.inputs_from_xarray(result.predictions)
-                score = float(weighted_mse(
-                    {k: pred[k] for k in variable_scales},
-                    {k: window.targets[k] for k in variable_scales},
-                    variable_scales=variable_scales,
-                    spatial_weights=quadrature_weights(model.data_coords.horizontal)))
+                # Pool initialization MSE before normalization; the same fixed
+                # training scales and equal lead/level/variable averaging apply.
+                score = normalized_forecast_mse(
+                    result.metrics, variable_scales,
+                    expected_initialization_count=len(validation_indices))
                 if score < best_validation:
                     best_validation = score
+                    best_epoch = epoch+1
                     save_checkpoint(model, output/'best.pkl', checkpoint)
-                _write_json(output/'validation-selection.json', {
+                selection = {
+                    'epoch': epoch+1, 'current_normalized_mse': score,
+                    'best_epoch': best_epoch,
                     'best_normalized_mse': best_validation,
-                    'selection': 'first validation initialization, all requested leads',
-                    'test_data_used': False})
+                    'initialization_count': len(validation_indices),
+                    'initialization_stride': args.validation_stride,
+                    'forecast_steps': validation_steps,
+                    'output_interval_hours': float(interval / np.timedelta64(1, 'h')),
+                    'forecast_horizon_hours': float(validation_steps*interval / np.timedelta64(1, 'h')),
+                    'initialization_start': result.metadata['initialization_start'],
+                    'initialization_end': result.metadata['initialization_end'],
+                    'forcing_mode': args.forcing_mode,
+                    'selection': 'all complete validation initializations at configured stride; all requested leads',
+                    'protocol': 'pool initialization MSE; divide by training scale squared; mean over leads, levels, then variables',
+                    'scale_source': 'scales.json (training-only normalization)',
+                    'test_data_used': False}
+                _write_json(output/'validation-selection.json', selection)
+                print(json.dumps({'validation': selection}), flush=True)
     print(f'Training checkpoint saved: {output / "last.pkl"}')
 
 
@@ -207,6 +222,10 @@ def main(argv=None):
     training.add_argument('--checkpoint', required=True)
     training.add_argument('--train-data', required=True)
     training.add_argument('--validation-data')
+    training.add_argument('--validation-stride', type=int, default=1,
+                          help='validation initialization stride in dataset samples (default: every complete start)')
+    training.add_argument('--validation-steps', type=int,
+                          help='checkpoint-selection horizon in output steps (default: --steps)')
     training.add_argument('--output', required=True)
     training.add_argument('--epochs', type=int, default=10)
     training.add_argument('--steps', type=int, default=4)

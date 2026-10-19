@@ -11,6 +11,11 @@ sampling, 별도의 memory model은 없습니다.
 버전·라이선스는 [UPSTREAM.md](UPSTREAM.md), 실제 실행 범위는
 [docs/validation.md](docs/validation.md)를 참고하세요.
 
+원본과 우리 모델의 **train → validation → test 실행 순서**는
+[docs/train_valid_test.md](docs/train_valid_test.md)를 따르세요. 제공된 runner는
+원본 그대로·동일 자료로 추가 학습한 원본·우리 모델을 같은 test 조건에서
+비교하고, 여러 validation 초기 시점으로 checkpoint를 선택합니다.
+
 ## 세 가지 비교군
 
 | mode | learned physics | native memory | 목적 |
@@ -154,9 +159,11 @@ ngcm-expert evaluate --checkpoint runs/experts/best.pkl \
 
 기본 학습 범위 `--scope physics`는 learned parameterization만 갱신합니다.
 `--scope all`은 encoder/decoder를 포함합니다. `last.pkl`은 매 epoch 저장되며
-validation을 지정하면 첫 validation 초기 시점의 normalized rollout MSE로
-`best.pkl`을 선택합니다. 이는 전체 validation period의 최적 모델이라는 뜻은
-아닙니다. 본 비교는 `--all-starts`로 여러 초기 시점에서 수행하세요.
+validation을 지정하면 모든 완전한 초기 시점의 pooled normalized rollout MSE로
+`best.pkl`을 선택합니다. `--validation-stride`로 초기화 간격을 지정하고
+`--validation-steps`로 학습보다 긴 검증 horizon을 선택할 수 있습니다.
+정규화에는 training scale만 사용합니다. 본 비교는 `--all-starts`로 여러
+초기 시점에서 수행하세요.
 checkpoint로 재시작하면 optimizer state는 새로 생성됩니다.
 
 기본 scale은 training 자료에서만 추정합니다. 큰 자료에서는 미리 산출한
