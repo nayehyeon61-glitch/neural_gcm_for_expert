@@ -27,7 +27,7 @@ parameter 수, update 수, 수렴 곡선과 학습 시간을 함께 보고한다
 
 ```bash
 cd /path/to/workdir
-git clone https://github.com/nayehyeon61-glitch/neural_gcm_for_expert.git
+git clone --branch experiment/train-valid-test https://github.com/nayehyeon61-glitch/neural_gcm_for_expert.git
 cd neural_gcm_for_expert
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -37,7 +37,8 @@ export CUDA_VISIBLE_DEVICES=0
 python -c 'import jax; print(jax.__version__); print(jax.devices())'
 ```
 
-이미 clone했다면 그 디렉터리에서 `git pull --ff-only` 후 설치한다.
+이미 clone했다면 그 디렉터리에서 `git fetch origin`,
+`git switch experiment/train-valid-test`, `git pull --ff-only` 후 설치한다.
 JAX 출력에 GPU가 보여야 한다. CUDA 13 wheel의 Linux driver 요구사항은 580
 이상이며 저장소의 JAX 0.7.2 고정 버전을 유지한다. 현재 trainer는 단일 장치
 학습이며 GPU 두 장을 자동으로 합쳐 쓰지 않는다. pip CUDA 라이브러리와
