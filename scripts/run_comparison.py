@@ -153,6 +153,10 @@ def train_comparison(args):
                 '--output', output / 'checkpoints' / f'{mode}-init.pkl')
     # The original model is fine-tuned first, providing ONE train-derived scale
     # file that every architecture uses, including validation model selection.
+    if getattr(args, 'init_only', False):
+        print(f'Initialized {output}; train each arm with: resume --run {output} --mode <mode>',
+              flush=True)
+        return
     for mode in trained:
         train_arm(output, protocol, mode)
     protocol['phase'] = 'trained'
@@ -169,7 +173,7 @@ def trained_modes(protocol):
     return protocol.get('trained_modes', protocol['modes'])
 
 
-def train_arm(output, protocol, mode):
+def train_arm(output, protocol, mode, wait_for_scales=False):
     label = arm_label(mode)
     command = [
         'train', '--checkpoint', output / 'checkpoints' / f'{mode}-init.pkl',
@@ -189,7 +193,11 @@ def train_arm(output, protocol, mode):
     # other arm uses, including validation model selection.
     first = trained_modes(protocol)[0]
     if mode != first:
-        command.extend(['--scales', output / arm_label(first) / 'scales.json'])
+        scales = output / arm_label(first) / 'scales.json'
+        while wait_for_scales and not scales.is_file():  # arms run in parallel
+            print(f'waiting for {scales}', flush=True)
+            time.sleep(60)
+        command.extend(['--scales', scales])
     run_cli(*command)
 
 
@@ -213,7 +221,13 @@ def resume_comparison(args):
     for mode in protocol['modes']:
         if not (output / 'checkpoints' / f'{mode}-init.pkl').is_file():
             raise FileNotFoundError(output / 'checkpoints' / f'{mode}-init.pkl')
-    for mode in trained_modes(protocol):
+    modes = trained_modes(protocol)
+    only = getattr(args, 'mode', None)
+    if only is not None:
+        if only not in modes:
+            raise ValueError(f'{only} is not a trained arm of this run: {modes}')
+        modes = [only]
+    for mode in modes:
         label = arm_label(mode)
         if arm_complete(output, protocol, label):
             print(f'{label}: complete, kept', flush=True)
@@ -223,9 +237,12 @@ def resume_comparison(args):
             archive = output / f'{label}.interrupted-{time.strftime("%Y%m%d-%H%M%S")}'
             partial.rename(archive)
             print(f'{label}: partial run archived to {archive.name}', flush=True)
-        train_arm(output, protocol, mode)
-    protocol['phase'] = 'trained'
-    save_json(output / 'protocol.json', protocol)
+        train_arm(output, protocol, mode, wait_for_scales=only is not None)
+    # With arms on separate GPUs, the last arm to finish marks the run trained.
+    if all(arm_complete(output, protocol, arm_label(m)) for m in trained_modes(protocol)):
+        protocol = json.loads((output / 'protocol.json').read_text())
+        protocol['phase'] = 'trained'
+        save_json(output / 'protocol.json', protocol)
 
 
 def concept_comparison(args):
@@ -367,6 +384,8 @@ def main(argv=None):
                        help='linear warmup updates, shared by every arm')
     train.add_argument('--seed', type=int, default=0)
     train.add_argument('--include-memoryless', action='store_true')
+    train.add_argument('--init-only', action='store_true',
+                       help='write protocol and init checkpoints; train arms with resume --mode')
     train.add_argument('--scratch-width', type=int,
                        help='physics from scratch: train a single physics network of this width '
                             'and the experts (both reinitialized); baseline is test reference only')
@@ -374,6 +393,7 @@ def main(argv=None):
     train.set_defaults(func=train_comparison)
     resume = phases.add_parser('resume', help='finish the arms of an interrupted run')
     resume.add_argument('--run', type=Path, required=True)
+    resume.add_argument('--mode', help='train only this arm (arms can run on separate GPUs)')
     resume.add_argument('--allow-cpu', action='store_true')
     resume.set_defaults(func=resume_comparison)
     concept = phases.add_parser('concept', help='add the concept ODE-loss arm to a run')
