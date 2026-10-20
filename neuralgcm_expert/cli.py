@@ -39,7 +39,8 @@ def initialize(args):
     model = from_checkpoint(checkpoint, mode=args.mode,
                             sample_inputs=reference.inputs_from_xarray(sample),
                             sample_forcings=reference.forcings_from_xarray(sample),
-                            rng=jax.random.PRNGKey(args.seed), gin_bindings=bindings)
+                            rng=jax.random.PRNGKey(args.seed), gin_bindings=bindings,
+                            keep_memory=getattr(args, 'keep_memory', False))
     if args.zero_expert_output:
         if args.mode != 'experts':
             raise ValueError('--zero-expert-output applies only to experts')
@@ -240,6 +241,8 @@ def main(argv=None):
     init.add_argument('--output', required=True)
     init.add_argument('--mode', choices=['baseline', 'memoryless', 'experts'], default='experts')
     init.add_argument('--no-residual', action='store_true')
+    init.add_argument('--keep-memory', action='store_true',
+                      help='experts: keep the official memory encoder and memory features')
     init.add_argument('--zero-expert-output', action='store_true',
                       help='zero-initialize expert/residual output layers (stable start)')
     init.add_argument('--remat-towers', action='store_true',

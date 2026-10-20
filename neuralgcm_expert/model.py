@@ -147,12 +147,15 @@ def _expert_mapping_bindings() -> list[str]:
 
 
 def convert_config(config: str, mode: Mode,
-                   gin_bindings: Sequence[str] = ()) -> str:
+                   gin_bindings: Sequence[str] = (), *, keep_memory: bool = False) -> str:
     """Return a no-memory/no-randomness configuration for supported legacy models.
 
     Excluding feature modules leaves normalization dictionaries intact. Gin
     retains inactive checkpoint definitions; their presence is not evidence of
     stochastic execution. Only the bound modules are materialized.
+
+    ``keep_memory`` (experts only) keeps the official memory encoder and memory
+    features, so only the learned-physics output mapping changes.
     """
     if mode not in ("baseline", "memoryless", "experts"):
         raise ValueError(f"Unknown mode: {mode!r}")
@@ -160,9 +163,13 @@ def convert_config(config: str, mode: Mode,
         if gin_bindings:
             raise ValueError("baseline preserves the checkpoint exactly; no Gin overrides allowed")
         return config
+    if keep_memory and mode != "experts":
+        raise ValueError("keep_memory applies only to experts mode")
     if mode == "experts":
         from neuralgcm_expert import mappings as _mappings  # noqa: F401
-    config = config.replace(_WITH_MEMORY, _WITHOUT_MEMORY)
+    if not keep_memory:
+        config = config.replace(_WITH_MEMORY, _WITHOUT_MEMORY)
+    excluded_features = _EXCLUDED_FEATURES if not keep_memory else ("RandomnessFeatures",)
     additions = []
     with gin_utils.specific_config(config):
         bindings = _configuration_bindings()
@@ -175,12 +182,13 @@ def convert_config(config: str, mode: Mode,
                 additions.append(f"{key}.perturbation_module = @NoPerturbation")
             if selector.endswith(".CombinedFeatures"):
                 excluded = tuple(values.get("feature_module_names_to_exclude", ()))
-                excluded = tuple(dict.fromkeys(excluded + _EXCLUDED_FEATURES))
+                excluded = tuple(dict.fromkeys(excluded + excluded_features))
                 additions.append(f"{key}.feature_module_names_to_exclude = {excluded!r}")
         # Include defaults even if these kwargs were absent in the source Gin.
+        encoder = _WITH_MEMORY if keep_memory else _WITHOUT_MEMORY
         additions.extend([
-            f"{_WITHOUT_MEMORY}.randomness_module = @NoRandomField",
-            f"{_WITHOUT_MEMORY}.perturbation_module = @NoPerturbation",
+            f"{encoder}.randomness_module = @NoRandomField",
+            f"{encoder}.perturbation_module = @NoPerturbation",
             "StochasticPhysicsParameterizationStep.randomness_module = @NoRandomField",
             "StochasticPhysicsParameterizationStep.perturbation_module = @NoPerturbation",
         ])
@@ -192,7 +200,7 @@ def convert_config(config: str, mode: Mode,
     report = configuration_report(result)
     if report["stochastic_bindings"] or report["perturbation_bindings"]:
         raise ValueError("Experiment overrides re-enabled randomness/perturbations")
-    if report["has_native_memory_encoder"]:
+    if report["has_native_memory_encoder"] and not keep_memory:
         raise ValueError("Experiment overrides re-enabled a memory encoder")
     return result
 
@@ -291,6 +299,7 @@ def from_checkpoint(
     rng: jax.Array | None = None,
     gin_bindings: Sequence[str] = (),
     allow_stochastic_conversion: bool = False,
+    keep_memory: bool = False,
 ) -> neuralgcm.PressureLevelModel:
     """Load an untouched baseline or initialize a modified learned-physics model.
 
@@ -316,7 +325,8 @@ def from_checkpoint(
             "official deterministic checkpoint. Controlled reinitialization can "
             "explicitly set allow_stochastic_conversion=True in memoryless/experts mode."
         )
-    config = convert_config(checkpoint["model_config_str"], mode, gin_bindings)
+    config = convert_config(checkpoint["model_config_str"], mode, gin_bindings,
+                            keep_memory=keep_memory)
     converted = dict(checkpoint, model_config_str=config)
     model = neuralgcm.PressureLevelModel.from_checkpoint(converted)
     metadata = {
@@ -325,6 +335,7 @@ def from_checkpoint(
         "source_was_stochastic": stochastic,
         "source_native_memory": source_report["has_native_memory_encoder"],
         "requires_training": mode != "baseline",
+        "native_memory_kept": mode == "baseline" or keep_memory,
         "original_checkpoint_config": checkpoint["model_config_str"],
     }
     if mode != "baseline":

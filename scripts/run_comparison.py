@@ -123,13 +123,14 @@ def train_comparison(args):
         'selection': 'pooled multi-initialization validation normalized forecast MSE',
         'tower_remat': 'non-baseline modes (memory only; identical values)',
         'expert_output_init': 'zero (expert and residual output layers)',
+        'expert_native_memory': 'kept (official memory encoder and memory features)',
         'warmup_steps': args.warmup_steps,
         'comparison_scope': 'transfer-learning experiment; not matched pretraining or parameter budgets',
     }
     save_json(output / 'protocol.json', protocol)
     for mode in modes:
         remat = ['--remat-towers'] if mode != 'baseline' else []
-        zero = ['--zero-expert-output'] if mode == 'experts' else []
+        zero = ['--zero-expert-output', '--keep-memory'] if mode == 'experts' else []
         run_cli('init', '--mode', mode, '--checkpoint', args.checkpoint,
                 '--data', args.train_data, '--seed', args.seed, *remat, *zero,
                 '--output', output / 'checkpoints' / f'{mode}-init.pkl')
