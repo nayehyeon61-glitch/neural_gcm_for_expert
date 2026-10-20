@@ -29,6 +29,13 @@ def initialize(args):
         if args.mode != 'experts':
             raise ValueError('--no-residual applies only to experts')
         bindings.append('DecomposedNodalMapping.enable_residual = False')
+    if args.remat_towers:
+        if args.mode == 'baseline':
+            raise ValueError('--remat-towers does not apply to the untouched baseline')
+        # Recompute column towers in the backward pass: identical values, but five
+        # expert towers otherwise store every column activation (~117 -> ~17 GiB).
+        bindings.extend(f'{scope}/ColumnTower.checkpoint_tower = True'
+                        for scope in ('encode', 'process', 'decode'))
     model = from_checkpoint(checkpoint, mode=args.mode,
                             sample_inputs=reference.inputs_from_xarray(sample),
                             sample_forcings=reference.forcings_from_xarray(sample),
@@ -204,6 +211,8 @@ def main(argv=None):
     init.add_argument('--output', required=True)
     init.add_argument('--mode', choices=['baseline', 'memoryless', 'experts'], default='experts')
     init.add_argument('--no-residual', action='store_true')
+    init.add_argument('--remat-towers', action='store_true',
+                      help='rematerialize column towers (memory only; same values)')
     init.add_argument('--seed', type=int, default=0)
     init.set_defaults(func=initialize)
     evaluation = commands.add_parser('evaluate', help='official pressure-level rollout and quadrature RMSE')

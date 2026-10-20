@@ -121,12 +121,14 @@ def train_comparison(args):
         'seed': args.seed, 'scope': 'physics', 'forcing_mode': 'persistence',
         'tendency_weight': 0.0, 'acceleration_weight': 0.0, 'residual_parameter_weight': 1e-6,
         'selection': 'pooled multi-initialization validation normalized forecast MSE',
+        'tower_remat': 'non-baseline modes (memory only; identical values)',
         'comparison_scope': 'transfer-learning experiment; not matched pretraining or parameter budgets',
     }
     save_json(output / 'protocol.json', protocol)
     for mode in modes:
+        remat = ['--remat-towers'] if mode != 'baseline' else []
         run_cli('init', '--mode', mode, '--checkpoint', args.checkpoint,
-                '--data', args.train_data, '--seed', args.seed,
+                '--data', args.train_data, '--seed', args.seed, *remat,
                 '--output', output / 'checkpoints' / f'{mode}-init.pkl')
     # The original model is fine-tuned first, providing ONE train-derived scale
     # file that every architecture uses, including validation model selection.
