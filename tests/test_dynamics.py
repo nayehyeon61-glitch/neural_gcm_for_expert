@@ -43,6 +43,8 @@ class _TinyPhysics(hk.Module):
         gain = hk.get_parameter("gain", (), init=hk.initializers.Constant(0.25))
         temperature = gain * state.temperature_variation
         temperature = temperature.at[:, 0, 0].add(0.001 * state.sim_time)
+        if memory is not None:  # memory-velocity-like feature
+            temperature = temperature + 0.5 * (state.temperature_variation - memory.temperature_variation)
         return dataclasses.replace(
             state,
             vorticity=jnp.zeros_like(state.vorticity),
@@ -154,7 +156,12 @@ def test_native_acceleration_time_and_parameter_gradients(native_fixture):
     np.testing.assert_allclose(gain_derivatives, [0.204], rtol=1e-4, atol=1e-6)
 
 
-def test_memory_cannot_silently_enter_native_rhs(native_fixture):
+def test_native_rhs_feeds_encoded_memory_to_physics(native_fixture):
     model, encoded = native_fixture
-    with pytest.raises(UnsupportedNativeDynamicsError, match="memory=None"):
-        native_rhs(model, dataclasses.replace(encoded, memory=encoded.state), {})
+    base = native_rhs(model, encoded, {}).temperature_variation
+    # Memory equal to the state: zero memory velocity, same tendency.
+    same = native_rhs(model, dataclasses.replace(encoded, memory=encoded.state), {})
+    np.testing.assert_allclose(same.temperature_variation, base, rtol=1e-6, atol=1e-9)
+    older = dataclasses.replace(encoded.state, temperature_variation=encoded.state.temperature_variation - 0.1)
+    moved = native_rhs(model, dataclasses.replace(encoded, memory=older), {})
+    assert not np.allclose(moved.temperature_variation, base)

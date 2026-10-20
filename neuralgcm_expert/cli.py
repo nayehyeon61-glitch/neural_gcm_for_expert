@@ -93,8 +93,8 @@ def train(args):
     from neuralgcm_expert.evaluation import (
         complete_forecast_starts, evaluate_many, normalized_forecast_mse, quadrature_weights)
     from neuralgcm_expert.training import (
-        LossConfig, estimate_scales, make_train_step, prepare_native_targets,
-        window_batch, with_params, trainable_mask)
+        LossConfig, estimate_native_scales, estimate_scales, make_train_step,
+        prepare_native_targets, window_batch, with_params, trainable_mask)
     del mappings
     if args.epochs < 1 or args.stride < 1 or args.validation_stride < 1:
         raise ValueError('epochs, stride and validation-stride must be positive')
@@ -107,7 +107,15 @@ def train(args):
     valid = open_dataset(args.validation_data) if args.validation_data else None
     times = _require_time(ds)
     interval = output_timedelta(model, args.interval)
-    horizon = max(args.steps, 2 if (args.tendency_weight or args.acceleration_weight) else 1)
+    ode_weights = {group: weight for group, weight in (
+        ('temperature', getattr(args, 'ode_temperature_weight', 0.0)),
+        ('momentum', getattr(args, 'ode_momentum_weight', 0.0)),
+        ('moisture', getattr(args, 'ode_moisture_weight', 0.0))) if weight}
+    config = LossConfig(tendency_weight=args.tendency_weight,
+                        acceleration_weight=args.acceleration_weight,
+                        residual_parameter_weight=args.residual_weight,
+                        ode_weights=ode_weights)
+    horizon = max(args.steps, 2 if config.uses_native else 1)
     indices = complete_forecast_starts(model, ds, horizon, interval, stride=args.stride)
     validation_indices = None
     if valid is not None:
@@ -124,9 +132,11 @@ def train(args):
            for value in variable_scales.values()):
         raise ValueError('Scale file must contain finite positive scalar values')
     native_scales = _json(args.native_scales)
-    config = LossConfig(tendency_weight=args.tendency_weight,
-                        acceleration_weight=args.acceleration_weight,
-                        residual_parameter_weight=args.residual_weight)
+    if config.uses_native and native_scales is None:
+        # Training data only: RMS native tendency over a fixed sample of triplets.
+        sample = np.random.default_rng(args.seed).choice(
+            indices, size=min(64, len(indices)), replace=False)
+        native_scales = estimate_native_scales(model, ds, args.interval, sample)
     _, opt_state, update = make_train_step(
         model, forecast_steps=args.steps, output_interval=args.interval,
         variable_scales=variable_scales,
@@ -137,6 +147,8 @@ def train(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output/'scales.json', variable_scales)
+    if native_scales is not None:
+        _write_json(output/'native_scales.json', native_scales)
     _write_json(output/'run.json', {k: v for k, v in vars(args).items() if k != 'func'})
     rng = np.random.default_rng(args.seed)
     params = model.params
@@ -155,7 +167,7 @@ def train(args):
                                               start_index=int(index),
                                               forcing_mode=args.forcing_mode)
                 batch = window_batch(window)
-                if args.tendency_weight or args.acceleration_weight:
+                if config.uses_native:
                     triplet_times = times[index] + np.arange(3)*interval
                     triplet = ds.sel(time=triplet_times)
                     native = prepare_native_targets(native_reference, triplet, args.interval,
@@ -281,6 +293,10 @@ def main(argv=None):
     training.add_argument('--tendency-weight', type=float, default=0.0)
     training.add_argument('--acceleration-weight', type=float, default=0.0)
     training.add_argument('--residual-weight', type=float, default=1e-6)
+    for group in ('temperature', 'momentum', 'moisture'):
+        training.add_argument(f'--ode-{group}-weight', type=float, default=0.0,
+                              help=f'lambda for the {group} concept ODE loss: (core + learned) '
+                                   'native tendency vs data central difference')
     training.add_argument('--forcing-mode', choices=['persistence', 'dynamic'], default='persistence')
     training.add_argument('--seed', type=int, default=0)
     training.set_defaults(func=train)

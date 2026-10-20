@@ -8,7 +8,9 @@ called with the original Haiku parameter paths. Numerical *step* filters and
 the finite-step IMEX map are not continuous tendencies and are excluded.
 
 State, tendencies, and time all use the checkpoint's native nondimensional
-units. The return value is the prognostic state tree, not a ModelState carrying
+units. Memory models: the physics network sees ``encoded_state.memory`` (the previous
+state used by memory features), held fixed; F is the tendency at that memory.
+The return value is the prognostic state tree, not a ModelState carrying
 diagnostics or random-generator bookkeeping. In particular, F.sim_time = 1.
 """
 
@@ -106,8 +108,6 @@ def _parameterization_step(model_module: Any) -> Any:
 def _prognostic_state(encoded_state: Any) -> Any:
     if not isinstance(encoded_state, dinosaur_typing.ModelState):
         raise TypeError("encoded_state must be the ModelState returned by model.encode().")
-    if encoded_state.memory is not None:
-        raise UnsupportedNativeDynamicsError("Continuous memoryless RHS requires encoded_state.memory=None.")
     if getattr(encoded_state.state, "sim_time", None) is None:
         raise ValueError("The encoded physical state must include nondimensional sim_time.")
     return encoded_state.state
@@ -122,14 +122,14 @@ def _processed_forcings(model: Any, state: Any, forcings: Any, params: Any) -> A
 
 
 def _transformed_components(model: Any) -> hk.Transformed:
-    def forward(state, forcing):
+    def forward(state, memory, forcing):
         # Construct the full original model: directly constructing a standalone
         # parameterization would change Haiku names and miss checkpoint weights.
         module = model._structure.model_cls()
         step = _parameterization_step(module)
         randomness = step.randomness_fn.unconditional_sample(None).nodal_value
         physics = step.physics_parameterization_fn(
-            state, None, {}, randomness, forcing
+            state, memory, {}, randomness, forcing
         )
         return _corrector_components(step.corrector_fn, state, physics)
 
@@ -151,7 +151,8 @@ def native_rhs_components(
     params = model.params if params is None else params
     with gin_utils.specific_config(model.gin_config):
         forcing = _processed_forcings(model, state, forcings, params)
-        return _transformed_components(model).apply(params, state, forcing)
+        return _transformed_components(model).apply(
+            params, state, encoded_state.memory, forcing)
 
 
 def native_rhs(model: Any, encoded_state: Any, forcings: Any, *, params: Any = None) -> Any:
@@ -198,7 +199,7 @@ def native_acceleration(
         apply = _transformed_components(model).apply
 
         def field(x, f):
-            return apply(params, x, f)["total"]
+            return apply(params, x, encoded_state.memory, f)["total"]
 
         velocity = field(state, forcing)
         if processed_forcing_tangent is None:

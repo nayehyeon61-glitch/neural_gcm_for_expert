@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 
 import jax
 import numpy as np
@@ -160,6 +161,57 @@ def train_comparison(args):
           'validation-selection.json before the separate test command.', flush=True)
 
 
+def concept_comparison(args):
+    """Add the concept-bottleneck arm to an existing run, on the same protocol.
+
+    The shared network is the official pretrained physics tower (its output
+    channels are the temperature/momentum/moisture concept heads; no residual
+    bypass). Training adds per-concept native ODE losses to the same rollout loss.
+    """
+    check_backend(args.allow_cpu)
+    output = args.run.resolve()
+    protocol = json.loads((output / 'protocol.json').read_text())
+    destination = output / 'concept'
+    if destination.exists():
+        raise FileExistsError(f'{destination} already exists')
+    if (output / 'test').exists():
+        raise ValueError('Test already ran; a new arm cannot join this run')
+    scales = output / 'baseline_finetuned' / 'scales.json'
+    if not scales.is_file():
+        raise FileNotFoundError(scales)
+    weights = {'temperature': args.ode_temperature_weight, 'momentum': args.ode_momentum_weight,
+               'moisture': args.ode_moisture_weight}
+    if not all(np.isfinite(w) and w > 0 for w in weights.values()):
+        raise ValueError('concept ODE weights must be finite and positive')
+    save_json(output / 'concept_protocol.json', {
+        'phase': 'training', 'base_protocol': protocol['repository_commit'],
+        'init': 'checkpoints/baseline-init.pkl (official shared physics network)',
+        'ode_weights': weights, 'ode_target': 'central difference of encoded training triplet',
+        'native_scales': 'RMS training native tendency (64 training triplets)'})
+    command = [
+        'train', '--checkpoint', output / 'checkpoints' / 'baseline-init.pkl',
+        '--train-data', args.train_data, '--validation-data', args.validation_data,
+        '--steps', protocol['train_steps'], '--interval', protocol['interval'],
+        '--validation-steps', protocol['evaluation_steps'],
+        '--validation-stride', protocol['validation_stride'],
+        '--stride', protocol['train_stride'], '--epochs', protocol['epochs'],
+        '--learning-rate', protocol['learning_rate'], '--seed', protocol['seed'],
+        '--warmup-steps', protocol['warmup_steps'],
+        '--scope', 'physics', '--forcing-mode', 'persistence',
+        '--tendency-weight', 0, '--acceleration-weight', 0, '--residual-weight', 1e-6,
+        '--ode-temperature-weight', weights['temperature'],
+        '--ode-momentum-weight', weights['momentum'],
+        '--ode-moisture-weight', weights['moisture'],
+        '--scales', scales, '--output', destination]
+    phase = 'failed'
+    try:
+        run_cli(*command)
+        phase = 'trained'
+    finally:
+        save_json(output / 'concept_protocol.json', {
+            **json.loads((output / 'concept_protocol.json').read_text()), 'phase': phase})
+
+
 def test_comparison(args):
     check_backend(args.allow_cpu)
     output = args.run.resolve()
@@ -180,6 +232,14 @@ def test_comparison(args):
                'experts': output / 'experts' / 'best.pkl'}
     if 'memoryless' in protocol['modes']:
         choices['memoryless'] = output / 'memoryless' / 'best.pkl'
+    concept = output / 'concept_protocol.json'
+    if concept.is_file():
+        # A concept arm running in parallel joins the one-shot test once done.
+        while json.loads(concept.read_text())['phase'] == 'training':
+            print('waiting for the concept arm to finish training', flush=True)
+            time.sleep(300)
+        if json.loads(concept.read_text())['phase'] == 'trained':
+            choices['concept'] = output / 'concept' / 'best.pkl'
     for path in choices.values():
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -191,13 +251,21 @@ def test_comparison(args):
                 '--all-starts', '--stride', protocol['test_stride'],
                 '--forcing-mode', protocol['forcing_mode'], '--output', destination / label)
     comparison = Path(__file__).with_name('compare_metrics.py')
-    for baseline in choices:
-        if baseline == 'experts':
-            continue
+    candidates = [name for name in ('experts', 'concept') if name in choices]
+    for candidate in candidates:
+        for baseline in choices:
+            if baseline in candidates:
+                continue
+            subprocess.run([
+                sys.executable, str(comparison), '--baseline', str(destination / baseline),
+                '--candidate', str(destination / candidate),
+                '--output', str(destination / f'{candidate}_vs_{baseline}.csv'),
+            ], check=True)
+    if len(candidates) == 2:
         subprocess.run([
-            sys.executable, str(comparison), '--baseline', str(destination / baseline),
-            '--candidate', str(destination / 'experts'),
-            '--output', str(destination / f'experts_vs_{baseline}.csv'),
+            sys.executable, str(comparison), '--baseline', str(destination / 'experts'),
+            '--candidate', str(destination / 'concept'),
+            '--output', str(destination / 'concept_vs_experts.csv'),
         ], check=True)
     protocol.update(phase='tested', test=info)
     save_json(output / 'protocol.json', protocol)
@@ -226,6 +294,14 @@ def main(argv=None):
     train.add_argument('--include-memoryless', action='store_true')
     train.add_argument('--allow-cpu', action='store_true')
     train.set_defaults(func=train_comparison)
+    concept = phases.add_parser('concept', help='add the concept ODE-loss arm to a run')
+    concept.add_argument('--run', type=Path, required=True)
+    concept.add_argument('--train-data', type=Path, required=True)
+    concept.add_argument('--validation-data', type=Path, required=True)
+    for group in ('temperature', 'momentum', 'moisture'):
+        concept.add_argument(f'--ode-{group}-weight', type=float, required=True)
+    concept.add_argument('--allow-cpu', action='store_true')
+    concept.set_defaults(func=concept_comparison)
     test = phases.add_parser('test', help='evaluate selected models on held-out test once')
     test.add_argument('--run', type=Path, required=True)
     test.add_argument('--test-data', type=Path, required=True)

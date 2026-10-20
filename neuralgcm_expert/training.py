@@ -1,8 +1,8 @@
 """Differentiate the official coupled NeuralGCM rollout, with optional ODE losses."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,17 +13,41 @@ from neuralgcm import PressureLevelModel
 from neuralgcm_expert.losses import weighted_mse, floating_dynamic_fields
 
 
+ODE_GROUPS = ('temperature', 'momentum', 'moisture')
+
+
+def ode_group(name):
+    """Physical concept of a native state field; None for fields physics does not set."""
+    parts = name.split('/')
+    if 'tracers' in parts:
+        return 'moisture'
+    if parts[-1] == 'temperature_variation':
+        return 'temperature'
+    if parts[-1] in ('vorticity', 'divergence'):
+        return 'momentum'
+    return None  # log_surface_pressure: masked in learned physics, dycore only
+
+
 @dataclass(frozen=True)
 class LossConfig:
     tendency_weight: float = 0.0
     acceleration_weight: float = 0.0
     residual_parameter_weight: float = 1e-6
+    # Per-concept intermediate ODE losses: lambda_k for temperature/momentum/moisture.
+    ode_weights: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         for value in (self.tendency_weight, self.acceleration_weight,
-                      self.residual_parameter_weight):
+                      self.residual_parameter_weight, *self.ode_weights.values()):
             if not np.isfinite(value) or value < 0:
                 raise ValueError("Loss weights must be finite and nonnegative")
+        if set(self.ode_weights) - set(ODE_GROUPS):
+            raise ValueError(f"ode_weights keys must be among {ODE_GROUPS}")
+
+    @property
+    def uses_native(self):
+        return bool(self.tendency_weight or self.acceleration_weight
+                    or any(self.ode_weights.values()))
 
 
 def with_params(model, params):
@@ -90,14 +114,15 @@ def residual_parameter_penalty(params):
     return sum(jnp.sum(x * x) for x in leaves) / sum(x.size for x in leaves)
 
 
-def prepare_native_targets(model, dataset, output_interval, *, native_scales):
+def prepare_native_targets(model, dataset, output_interval, *, native_scales,
+                           validate_scales=True):
     """Encode a reference triplet once; targets are frozen during optimization.
 
     Finite differences describe the encoder's native coordinate representation,
     not observed process-specific tendencies. Units are nondimensional model time.
     """
     import pandas as pd
-    if native_scales is None:
+    if validate_scales and native_scales is None:
         raise ValueError("ODE losses require explicit native field scales")
     if dataset.sizes.get('time', 0) != 3:
         raise ValueError("Native derivative supervision requires exactly three times")
@@ -117,10 +142,11 @@ def prepare_native_targets(model, dataset, output_interval, *, native_scales):
     first = jax.tree_util.tree_map(lambda a, b: (b-a)/(2*dt), x0, x2)
     second = jax.tree_util.tree_map(lambda a, b, c: (c-2*b+a)/(dt*dt), x0, x1, x2)
     required = set(floating_dynamic_fields(state_fields(first)))
-    if set(native_scales) != required:
-        raise ValueError(f"native_scales must specify every native field exactly; expected {sorted(required)}")
-    if any(not np.isfinite(v) or v <= 0 for v in native_scales.values()):
-        raise ValueError('native_scales must contain finite positive values')
+    if validate_scales:
+        if set(native_scales) != required:
+            raise ValueError(f"native_scales must specify every native field exactly; expected {sorted(required)}")
+        if any(not np.isfinite(v) or v <= 0 for v in native_scales.values()):
+            raise ValueError('native_scales must contain finite positive values')
     return {'state': states[1], 'forcings': forcings[1],
             'tendency': state_fields(first), 'acceleration': state_fields(second),
             'scales': native_scales}
@@ -146,6 +172,31 @@ def checkpointed_unroll(model, state, forcings, steps, output_interval):
     return jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *outputs)
 
 
+def estimate_native_scales(model, dataset, output_interval, start_indices):
+    """RMS of the data-derived native tendency per field, over training triplets only.
+
+    Native fields are modal coefficients in nondimensional units, so data-space
+    scales do not apply; these fixed scales normalize each concept ODE loss.
+    """
+    import pandas as pd
+    interval = np.timedelta64(pd.Timedelta(output_interval).value, 'ns')
+    times = dataset.time.values
+    sums, count = {}, 0
+    for index in start_indices:
+        triplet = dataset.sel(time=times[index] + np.arange(3)*interval)
+        tendency = prepare_native_targets(model, triplet, output_interval, native_scales=None,
+                                          validate_scales=False)['tendency']
+        for name, value in floating_dynamic_fields(tendency).items():
+            sums[name] = sums.get(name, 0.0) + float(jnp.mean(jnp.square(value)))
+        count += 1
+    if not count:
+        raise ValueError('No training triplets for native scale estimation')
+    scales = {name: float(np.sqrt(total/count)) for name, total in sums.items()}
+    if any(not np.isfinite(v) or v <= 0 for v in scales.values()):
+        raise ValueError(f'Degenerate native tendency scales: {scales}')
+    return scales
+
+
 def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
                     spatial_weights=None, loss_config=LossConfig(),
                     learning_rate=1e-4, scope='physics', native_scales=None,
@@ -158,7 +209,7 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
     if (not isinstance(forecast_steps, int) or isinstance(forecast_steps, bool)
             or forecast_steps < 1 or not np.isfinite(learning_rate) or learning_rate <= 0):
         raise ValueError("forecast_steps and learning_rate must be positive")
-    use_native = bool(loss_config.tendency_weight or loss_config.acceleration_weight)
+    use_native = loss_config.uses_native
     if use_native and not native_scales:
         raise ValueError("Supply native_scales to enable native ODE losses")
     if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 0:
@@ -187,22 +238,36 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
                                 spatial_weights=spatial_weights)
         regularization = residual_parameter_penalty(effective_params)
         tendency, acceleration = jnp.asarray(0.0), jnp.asarray(0.0)
+        concept_losses = {}
         if use_native:
             from neuralgcm_expert.dynamics import native_rhs, native_acceleration
             native = batch['native']
+            if loss_config.tendency_weight or any(loss_config.ode_weights.values()):
+                rhs = state_fields(native_rhs(current, native['state'], native['forcings']))
             if loss_config.tendency_weight:
-                tendency = weighted_mse(
-                    state_fields(native_rhs(current, native['state'], native['forcings'])),
-                    native['tendency'], variable_scales=native_scales)
+                tendency = weighted_mse(rhs, native['tendency'], variable_scales=native_scales)
+            if any(loss_config.ode_weights.values()):
+                # Core + learned tendency of each concept vs the data-derived total
+                # tendency of the same fields; the supervised values enter the solver.
+                predicted = floating_dynamic_fields(rhs)
+                expected = floating_dynamic_fields(native['tendency'])
+                for group, weight in loss_config.ode_weights.items():
+                    names = [n for n in predicted if ode_group(n) == group]
+                    if weight and names:
+                        concept_losses[group] = weighted_mse(
+                            {n: predicted[n] for n in names}, {n: expected[n] for n in names},
+                            variable_scales={n: native_scales[n] for n in names})
             if loss_config.acceleration_weight:
                 acceleration = weighted_mse(
                     state_fields(native_acceleration(current, native['state'], native['forcings'])),
                     native['acceleration'], variable_scales=native_scales)
         total = (forecast + loss_config.tendency_weight*tendency
                  + loss_config.acceleration_weight*acceleration
-                 + loss_config.residual_parameter_weight*regularization)
+                 + loss_config.residual_parameter_weight*regularization
+                 + sum(loss_config.ode_weights[g]*value for g, value in concept_losses.items()))
         return total, {'total': total, 'forecast': forecast, 'tendency': tendency,
-                       'acceleration': acceleration, 'residual_parameter': regularization}
+                       'acceleration': acceleration, 'residual_parameter': regularization,
+                       **{f'ode_{g}': value for g, value in concept_losses.items()}}
 
     @jax.jit
     def update(params, opt_state, batch):
