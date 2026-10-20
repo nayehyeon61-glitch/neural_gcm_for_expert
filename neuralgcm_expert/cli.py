@@ -167,31 +167,44 @@ def train(args):
                 'note': 'Training executed; forecast skill and long-term stability are not certified.'})
             save_checkpoint(model, output/'last.pkl', checkpoint)
             if valid is not None:
-                result = evaluate_many(
-                    model, valid, forecast_steps=validation_steps,
-                    output_interval=args.interval, forcing_mode=args.forcing_mode,
-                    stride=args.validation_stride, store_predictions=False)
-                result.save(output/f'validation-epoch-{epoch+1}')
-                # Pool initialization MSE before normalization; the same fixed
-                # training scales and equal lead/level/variable averaging apply.
-                score = normalized_forecast_mse(
-                    result.metrics, variable_scales,
-                    expected_initialization_count=len(validation_indices))
+                # A freshly initialized architecture can blow up in the validation
+                # rollout; score that epoch as +inf (never selected) and keep training.
+                try:
+                    result = evaluate_many(
+                        model, valid, forecast_steps=validation_steps,
+                        output_interval=args.interval, forcing_mode=args.forcing_mode,
+                        stride=args.validation_stride, store_predictions=False)
+                except ValueError as exc:
+                    if 'non-finite' not in str(exc):
+                        raise
+                    result, score, failure = None, float('inf'), str(exc)
+                else:
+                    result.save(output/f'validation-epoch-{epoch+1}')
+                    # Pool initialization MSE before normalization; the same fixed
+                    # training scales and equal lead/level/variable averaging apply.
+                    score = normalized_forecast_mse(
+                        result.metrics, variable_scales,
+                        expected_initialization_count=len(validation_indices))
+                    failure = None
                 if score < best_validation:
                     best_validation = score
                     best_epoch = epoch+1
                     save_checkpoint(model, output/'best.pkl', checkpoint)
                 selection = {
-                    'epoch': epoch+1, 'current_normalized_mse': score,
+                    'epoch': epoch+1,
+                    'current_normalized_mse': score if np.isfinite(score) else None,
+                    'current_failure': failure,
                     'best_epoch': best_epoch,
-                    'best_normalized_mse': best_validation,
+                    'best_normalized_mse': best_validation if np.isfinite(best_validation) else None,
                     'initialization_count': len(validation_indices),
                     'initialization_stride': args.validation_stride,
                     'forecast_steps': validation_steps,
                     'output_interval_hours': float(interval / np.timedelta64(1, 'h')),
                     'forecast_horizon_hours': float(validation_steps*interval / np.timedelta64(1, 'h')),
-                    'initialization_start': result.metadata['initialization_start'],
-                    'initialization_end': result.metadata['initialization_end'],
+                    'initialization_start': (result.metadata['initialization_start'] if result is not None
+                                             else str(valid_times[validation_indices[0]])),
+                    'initialization_end': (result.metadata['initialization_end'] if result is not None
+                                           else str(valid_times[validation_indices[-1]])),
                     'forcing_mode': args.forcing_mode,
                     'selection': 'all complete validation initializations at configured stride; all requested leads',
                     'protocol': 'pool initialization MSE; divide by training scale squared; mean over leads, levels, then variables',
