@@ -32,21 +32,24 @@ def initialize(args):
     if args.remat_towers:
         # Recompute column towers in the backward pass: identical values, but five
         # expert towers otherwise store every column activation (~117 -> ~17 GiB).
-        bindings.extend(f'{scope}/ColumnTower.checkpoint_tower = True'
-                        for scope in ('encode', 'process', 'decode'))
+        scopes = ('encode', 'process', 'decode') + (('physics_wide_process',) if args.mode == 'wide' else ())
+        bindings.extend(f'{scope}/ColumnTower.checkpoint_tower = True' for scope in scopes)
     model = from_checkpoint(checkpoint, mode=args.mode,
                             sample_inputs=reference.inputs_from_xarray(sample),
                             sample_forcings=reference.forcings_from_xarray(sample),
                             rng=jax.random.PRNGKey(args.seed), gin_bindings=bindings,
-                            keep_memory=getattr(args, 'keep_memory', False))
+                            keep_memory=getattr(args, 'keep_memory', False),
+                            physics_width=getattr(args, 'physics_width', None),
+                            reinit_physics=getattr(args, 'reinit_physics', False))
     if args.zero_expert_output:
-        if args.mode != 'experts':
-            raise ValueError('--zero-expert-output applies only to experts')
+        if args.mode not in ('experts', 'wide'):
+            raise ValueError('--zero-expert-output applies only to newly initialized physics')
         from neuralgcm_expert.training import with_params
         # Random expert heads blow up the rollout within ~24 h; zero output layers
         # start from the dycore alone while hidden layers keep their random init.
-        zeroed = [name for name in model.params
-                  if 'decomposed_nodal_mapping' in name and 'decode_tower' in name]
+        zeroed = [name for name in model.params if 'decode_tower' in name and (
+            'decomposed_nodal_mapping' in name or
+            ('div_curl_neural_parameterization/nodal_mapping' in name))]
         if not zeroed:
             raise ValueError('No expert output layers found to zero')
         model = with_params(model, {
@@ -251,7 +254,11 @@ def main(argv=None):
     init.add_argument('--checkpoint', required=True)
     init.add_argument('--data', required=True, help='prepared official-grid ERA5 NetCDF or Zarr')
     init.add_argument('--output', required=True)
-    init.add_argument('--mode', choices=['baseline', 'memoryless', 'experts'], default='experts')
+    init.add_argument('--mode', choices=['baseline', 'memoryless', 'experts', 'wide'], default='experts')
+    init.add_argument('--physics-width', type=int,
+                      help='wide: hidden/latent width of the single physics network (official 384)')
+    init.add_argument('--reinit-physics', action='store_true',
+                      help='learned physics from scratch: copy no parameterization weights')
     init.add_argument('--no-residual', action='store_true')
     init.add_argument('--keep-memory', action='store_true',
                       help='experts: keep the official memory encoder and memory features')

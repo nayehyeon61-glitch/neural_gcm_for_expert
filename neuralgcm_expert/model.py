@@ -25,8 +25,9 @@ import neuralgcm
 from neuralgcm.legacy import gin_utils
 import numpy as np
 
-Mode = Literal["baseline", "memoryless", "experts"]
+Mode = Literal["baseline", "memoryless", "experts", "wide"]
 SUPPORTED_NEURALGCM_VERSION = "1.2.2"
+_PHYSICS_MODULE = "div_curl_neural_parameterization"
 _WITH_MEMORY = "DimensionalLearnedWeatherbenchToPrimitiveWithMemoryEncoder"
 _WITHOUT_MEMORY = "DimensionalLearnedWeatherbenchToPrimitiveEncoder"
 _EXCLUDED_FEATURES = (
@@ -107,6 +108,49 @@ def _reference_bindings(value: Any, inherited_scope: str = "") -> tuple[str, str
     return selector, scope, bindings
 
 
+def _wide_mapping_bindings(width: int) -> list[str]:
+    """Same single physics network, with every hidden/latent width set to ``width``.
+
+    Scoped to the learned-physics mapping only: the encoder/decoder share the
+    unscoped EpdTower configuration and keep their checkpoint architecture.
+    """
+    scoped_parameterization, mapping, factory = _physics_mapping_refs()
+    if factory.lstrip("@") != "EpdTower":
+        raise ValueError(f"wide mode expects the official EpdTower factory, got {factory}")
+    bindings = [
+        f"{scoped_parameterization}.nodal_mapping_module = @physics_wide/{mapping}",
+        f"physics_wide/{mapping}.tower_factory = @physics_wide/EpdTower",
+        f"physics_wide/EpdTower.latent_size = {width}",
+        "physics_wide/EpdTower.process_tower_factory = @physics_wide_process/ColumnTower",
+    ]
+    # Copy every official process-block setting into the new scope, then widen it.
+    for selector in ("ColumnTower", "MlpUniform"):
+        for name, value in gin.get_bindings(f"process/{selector}", resolve_references=False).items():
+            if selector == "ColumnTower" and name == "column_net_factory":
+                value = "@physics_wide_process/MlpUniform"
+            elif selector == "MlpUniform" and name == "num_hidden_units":
+                value = width
+            text = value if isinstance(value, str) and value.startswith("@") else (
+                str(value) if type(value).__name__ in ("ConfigurableReference", "MacroReference")
+                else repr(value))
+            bindings.append(f"physics_wide_process/{selector}.{name} = {text}")
+    return bindings
+
+
+def _physics_mapping_refs() -> tuple[str, str, str]:
+    model_ref = gin.get_bindings("WhirlModel", resolve_references=False).get("model_cls")
+    model_selector, model_scope, model_args = _reference_bindings(model_ref)
+    step_selector, step_scope, step_args = _reference_bindings(model_args.get("advance_module"), model_scope)
+    parameterization, physics_scope, physics_args = _reference_bindings(
+        step_args.get("physics_parameterization_module"), step_scope)
+    mapping, mapping_scope, mapping_args = _reference_bindings(
+        physics_args.get("nodal_mapping_module"), physics_scope)
+    if mapping_scope:
+        raise ValueError("wide mode expects an unscoped NodalMapping")
+    scoped_parameterization = f"{physics_scope}/{parameterization}" if physics_scope else parameterization
+    return scoped_parameterization, mapping, _resolve_reference(mapping_args["tower_factory"])
+
+
 def _expert_mapping_bindings() -> list[str]:
     """Inherit the actual active learned mapping's factory and Gin scope.
 
@@ -147,7 +191,8 @@ def _expert_mapping_bindings() -> list[str]:
 
 
 def convert_config(config: str, mode: Mode,
-                   gin_bindings: Sequence[str] = (), *, keep_memory: bool = False) -> str:
+                   gin_bindings: Sequence[str] = (), *, keep_memory: bool = False,
+                   physics_width: int | None = None) -> str:
     """Return a no-memory/no-randomness configuration for supported legacy models.
 
     Excluding feature modules leaves normalization dictionaries intact. Gin
@@ -157,7 +202,7 @@ def convert_config(config: str, mode: Mode,
     ``keep_memory`` (experts only) keeps the official memory encoder and memory
     features, so only the learned-physics output mapping changes.
     """
-    if mode not in ("baseline", "memoryless", "experts"):
+    if mode not in ("baseline", "memoryless", "experts", "wide"):
         raise ValueError(f"Unknown mode: {mode!r}")
     if mode == "baseline":
         # Only value-preserving rematerialization may be added to the baseline.
@@ -166,7 +211,14 @@ def convert_config(config: str, mode: Mode,
         if gin_bindings:
             config += "\n# memory-only rematerialization\n" + "\n".join(gin_bindings)
         return config
-    if keep_memory and mode != "experts":
+    if mode == "wide":
+        # The original architecture (memory kept) with a wider physics network.
+        if not physics_width or physics_width < 1:
+            raise ValueError("wide mode requires a positive physics_width")
+        keep_memory = True
+    elif physics_width is not None:
+        raise ValueError("physics_width applies only to wide mode")
+    if keep_memory and mode not in ("experts", "wide"):
         raise ValueError("keep_memory applies only to experts mode")
     if mode == "experts":
         from neuralgcm_expert import mappings as _mappings  # noqa: F401
@@ -197,6 +249,8 @@ def convert_config(config: str, mode: Mode,
         ])
         if mode == "experts":
             additions.extend(_expert_mapping_bindings())
+        if mode == "wide":
+            additions.extend(_wide_mapping_bindings(physics_width))
     result = config + "\n# neuralgcm_expert conversion\n" + "\n".join(additions)
     if gin_bindings:
         result += "\n# explicit experiment overrides\n" + "\n".join(gin_bindings)
@@ -303,6 +357,8 @@ def from_checkpoint(
     gin_bindings: Sequence[str] = (),
     allow_stochastic_conversion: bool = False,
     keep_memory: bool = False,
+    physics_width: int | None = None,
+    reinit_physics: bool = False,
 ) -> neuralgcm.PressureLevelModel:
     """Load an untouched baseline or initialize a modified learned-physics model.
 
@@ -328,8 +384,10 @@ def from_checkpoint(
             "official deterministic checkpoint. Controlled reinitialization can "
             "explicitly set allow_stochastic_conversion=True in memoryless/experts mode."
         )
+    if reinit_physics and mode == "baseline":
+        raise ValueError("baseline keeps the checkpoint exactly; reinit_physics needs a converted mode")
     config = convert_config(checkpoint["model_config_str"], mode, gin_bindings,
-                            keep_memory=keep_memory)
+                            keep_memory=keep_memory, physics_width=physics_width)
     converted = dict(checkpoint, model_config_str=config)
     model = neuralgcm.PressureLevelModel.from_checkpoint(converted)
     metadata = {
@@ -338,7 +396,9 @@ def from_checkpoint(
         "source_was_stochastic": stochastic,
         "source_native_memory": source_report["has_native_memory_encoder"],
         "requires_training": mode != "baseline",
-        "native_memory_kept": mode == "baseline" or keep_memory,
+        "native_memory_kept": mode in ("baseline", "wide") or keep_memory,
+        "physics_width": physics_width,
+        "physics_reinitialized": reinit_physics,
         "original_checkpoint_config": checkpoint["model_config_str"],
     }
     if mode != "baseline":
@@ -351,7 +411,12 @@ def from_checkpoint(
         with gin_utils.specific_config(model.gin_config):
             initialized = model._structure.init_params(rng, trajectory, forcing_data)
         aliases = _state_encoder_aliases(checkpoint["model_config_str"], initialized, checkpoint["params"])
-        params, transfer_report = transfer_matching_params(initialized, checkpoint["params"], aliases)
+        source = checkpoint["params"]
+        if reinit_physics:
+            # Learned physics from scratch: nothing under the parameterization is copied.
+            source = {k: v for k, v in source.items() if _PHYSICS_MODULE not in k}
+            aliases = {k: v for k, v in aliases.items() if _PHYSICS_MODULE not in v}
+        params, transfer_report = transfer_matching_params(initialized, source, aliases)
         model = neuralgcm.PressureLevelModel(model._structure, params, model.gin_config)
         metadata["parameter_transfer"] = transfer_report
         if stochastic:

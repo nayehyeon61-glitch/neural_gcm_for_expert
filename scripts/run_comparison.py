@@ -99,6 +99,13 @@ def train_comparison(args):
     modes = ['baseline', 'experts']
     if args.include_memoryless:
         modes.insert(1, 'memoryless')
+    if args.scratch_width:
+        # Physics from scratch: a single wide network vs the experts, matched in size.
+        # The untouched baseline is initialized only as the pretrained test reference.
+        if args.include_memoryless:
+            raise ValueError('--scratch-width does not combine with --include-memoryless')
+        modes = ['baseline', 'wide', 'experts']
+    trained = [m for m in modes if not (args.scratch_width and m == 'baseline')]
     output.mkdir(parents=True, exist_ok=True)
     try:
         revision = subprocess.check_output(
@@ -115,6 +122,8 @@ def train_comparison(args):
         'versions': {name: importlib.metadata.version(name)
                      for name in ('jax', 'jaxlib', 'neuralgcm', 'dinosaur')},
         'train': train_info, 'validation': valid_info, 'modes': modes,
+        'trained_modes': trained, 'physics_from_scratch': bool(args.scratch_width),
+        'wide_physics_width': args.scratch_width,
         'interval': args.interval, 'train_steps': args.train_steps,
         'evaluation_steps': args.evaluation_steps, 'epochs': args.epochs,
         'train_stride': args.train_stride, 'validation_stride': args.validation_stride,
@@ -127,17 +136,24 @@ def train_comparison(args):
         'expert_output_init': 'zero (expert and residual output layers)',
         'expert_native_memory': 'kept (official memory encoder and memory features)',
         'warmup_steps': args.warmup_steps,
-        'comparison_scope': 'transfer-learning experiment; not matched pretraining or parameter budgets',
+        'comparison_scope': (
+            'learned physics from scratch (encoder/decoder official, frozen); single wide network '
+            'vs experts at matched physics parameter count' if args.scratch_width else
+            'transfer-learning experiment; not matched pretraining or parameter budgets'),
     }
     save_json(output / 'protocol.json', protocol)
     for mode in modes:
-        zero = ['--zero-expert-output', '--keep-memory'] if mode == 'experts' else []
+        extra = ['--zero-expert-output', '--keep-memory'] if mode == 'experts' else []
+        if mode == 'wide':
+            extra = ['--zero-expert-output', '--physics-width', args.scratch_width]
+        if args.scratch_width and mode != 'baseline':
+            extra.append('--reinit-physics')
         run_cli('init', '--mode', mode, '--checkpoint', args.checkpoint,
-                '--data', args.train_data, '--seed', args.seed, '--remat-towers', *zero,
+                '--data', args.train_data, '--seed', args.seed, '--remat-towers', *extra,
                 '--output', output / 'checkpoints' / f'{mode}-init.pkl')
     # The original model is fine-tuned first, providing ONE train-derived scale
     # file that every architecture uses, including validation model selection.
-    for mode in modes:
+    for mode in trained:
         train_arm(output, protocol, mode)
     protocol['phase'] = 'trained'
     save_json(output / 'protocol.json', protocol)
@@ -145,8 +161,16 @@ def train_comparison(args):
           'validation-selection.json before the separate test command.', flush=True)
 
 
+def arm_label(mode):
+    return 'baseline_finetuned' if mode == 'baseline' else mode
+
+
+def trained_modes(protocol):
+    return protocol.get('trained_modes', protocol['modes'])
+
+
 def train_arm(output, protocol, mode):
-    label = 'baseline_finetuned' if mode == 'baseline' else mode
+    label = arm_label(mode)
     command = [
         'train', '--checkpoint', output / 'checkpoints' / f'{mode}-init.pkl',
         '--train-data', protocol['train']['path'],
@@ -161,8 +185,11 @@ def train_arm(output, protocol, mode):
         '--tendency-weight', 0, '--acceleration-weight', 0, '--residual-weight', 1e-6,
         '--output', output / label,
     ]
-    if mode != 'baseline':
-        command.extend(['--scales', output / 'baseline_finetuned' / 'scales.json'])
+    # The first trained arm estimates ONE train-derived scale file that every
+    # other arm uses, including validation model selection.
+    first = trained_modes(protocol)[0]
+    if mode != first:
+        command.extend(['--scales', output / arm_label(first) / 'scales.json'])
     run_cli(*command)
 
 
@@ -186,8 +213,8 @@ def resume_comparison(args):
     for mode in protocol['modes']:
         if not (output / 'checkpoints' / f'{mode}-init.pkl').is_file():
             raise FileNotFoundError(output / 'checkpoints' / f'{mode}-init.pkl')
-    for mode in protocol['modes']:
-        label = 'baseline_finetuned' if mode == 'baseline' else mode
+    for mode in trained_modes(protocol):
+        label = arm_label(mode)
         if arm_complete(output, protocol, label):
             print(f'{label}: complete, kept', flush=True)
             continue
@@ -271,11 +298,9 @@ def test_comparison(args):
     check_order(protocol['validation'], info)
     if info['sample_interval_hours'] != protocol['train']['sample_interval_hours']:
         raise ValueError('Use the same time sampling in train, validation and test')
-    choices = {'baseline_pretrained': reference,
-               'baseline_finetuned': output / 'baseline_finetuned' / 'best.pkl',
-               'experts': output / 'experts' / 'best.pkl'}
-    if 'memoryless' in protocol['modes']:
-        choices['memoryless'] = output / 'memoryless' / 'best.pkl'
+    choices = {'baseline_pretrained': reference}
+    for mode in trained_modes(protocol):
+        choices[arm_label(mode)] = output / arm_label(mode) / 'best.pkl'
     concept = output / 'concept_protocol.json'
     if concept.is_file():
         # A concept arm running in parallel joins the one-shot test once done.
@@ -295,7 +320,7 @@ def test_comparison(args):
                 '--all-starts', '--stride', protocol['test_stride'],
                 '--forcing-mode', protocol['forcing_mode'], '--output', destination / label)
     comparison = Path(__file__).with_name('compare_metrics.py')
-    candidates = [name for name in ('experts', 'concept') if name in choices]
+    candidates = [name for name in ('wide', 'experts', 'concept') if name in choices]
     for candidate in candidates:
         for baseline in choices:
             if baseline in candidates:
@@ -305,7 +330,13 @@ def test_comparison(args):
                 '--candidate', str(destination / candidate),
                 '--output', str(destination / f'{candidate}_vs_{baseline}.csv'),
             ], check=True)
-    if len(candidates) == 2:
+    if 'wide' in choices:
+        subprocess.run([
+            sys.executable, str(comparison), '--baseline', str(destination / 'wide'),
+            '--candidate', str(destination / 'experts'),
+            '--output', str(destination / 'experts_vs_wide.csv'),
+        ], check=True)
+    if 'concept' in choices and 'experts' in choices:
         subprocess.run([
             sys.executable, str(comparison), '--baseline', str(destination / 'experts'),
             '--candidate', str(destination / 'concept'),
@@ -336,6 +367,9 @@ def main(argv=None):
                        help='linear warmup updates, shared by every arm')
     train.add_argument('--seed', type=int, default=0)
     train.add_argument('--include-memoryless', action='store_true')
+    train.add_argument('--scratch-width', type=int,
+                       help='physics from scratch: train a single physics network of this width '
+                            'and the experts (both reinitialized); baseline is test reference only')
     train.add_argument('--allow-cpu', action='store_true')
     train.set_defaults(func=train_comparison)
     resume = phases.add_parser('resume', help='finish the arms of an interrupted run')
