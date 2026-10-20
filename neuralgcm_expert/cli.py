@@ -114,7 +114,8 @@ def train(args):
     config = LossConfig(tendency_weight=args.tendency_weight,
                         acceleration_weight=args.acceleration_weight,
                         residual_parameter_weight=args.residual_weight,
-                        ode_weights=ode_weights)
+                        ode_weights=ode_weights,
+                        ode_target=getattr(args, 'ode_target', 'interval'))
     horizon = max(args.steps, 2 if config.uses_native else 1)
     indices = complete_forecast_starts(model, ds, horizon, interval, stride=args.stride)
     validation_indices = None
@@ -136,7 +137,8 @@ def train(args):
         # Training data only: RMS native tendency over a fixed sample of triplets.
         sample = np.random.default_rng(args.seed).choice(
             indices, size=min(64, len(indices)), replace=False)
-        native_scales = estimate_native_scales(model, ds, args.interval, sample)
+        native_scales = estimate_native_scales(model, ds, args.interval, sample,
+                                               target=config.ode_target)
     _, opt_state, update = make_train_step(
         model, forecast_steps=args.steps, output_interval=args.interval,
         variable_scales=variable_scales,
@@ -296,7 +298,10 @@ def main(argv=None):
     for group in ('temperature', 'momentum', 'moisture'):
         training.add_argument(f'--ode-{group}-weight', type=float, default=0.0,
                               help=f'lambda for the {group} concept ODE loss: (core + learned) '
-                                   'native tendency vs data central difference')
+                                   'tendency vs the encoded data tendency')
+    training.add_argument('--ode-target', choices=['interval', 'instantaneous'], default='interval',
+                          help='interval: solver-integrated concept tendency over each output '
+                               'interval; instantaneous: native RHS vs central difference')
     training.add_argument('--forcing-mode', choices=['persistence', 'dynamic'], default='persistence')
     training.add_argument('--seed', type=int, default=0)
     training.set_defaults(func=train)

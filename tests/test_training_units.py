@@ -1,8 +1,13 @@
+from collections import namedtuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from neuralgcm_expert.training import checkpointed_unroll
+
+
+ModelState = namedtuple('ModelState', 'state')  # pytree, like dinosaur's ModelState
 
 
 class ToyModel:
@@ -14,11 +19,14 @@ class ToyModel:
     def unroll(self, state, forcings, *, steps, timedelta, start_with_input):
         assert not start_with_input
 
+        state = state.state if isinstance(state, ModelState) else state
+
         def step(s, _):
             s = jnp.tanh(self.w * s + forcings['f'])
             return s, {'x': s * 2.0}
 
-        return jax.lax.scan(step, state, None, length=steps)
+        final, outputs = jax.lax.scan(step, state, None, length=steps)
+        return ModelState(final), outputs
 
 
 def test_matches_plain_unroll_values_and_gradients():

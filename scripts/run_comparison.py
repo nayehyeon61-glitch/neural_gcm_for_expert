@@ -186,8 +186,12 @@ def concept_comparison(args):
     save_json(output / 'concept_protocol.json', {
         'phase': 'training', 'base_protocol': protocol['repository_commit'],
         'init': 'checkpoints/baseline-init.pkl (official shared physics network)',
-        'ode_weights': weights, 'ode_target': 'central difference of encoded training triplet',
-        'native_scales': 'RMS training native tendency (64 training triplets)'})
+        'ode_weights': weights, 'ode_target': args.ode_target,
+        'ode_target_definition': {
+            'interval': 'per output interval j: P_k (x_hat_j - x*_0)/(j dt) vs P_k (x*_j - x*_0)/(j dt), '
+                        'x_hat from the trained solver rollout, x* the frozen encoder on ERA5',
+            'instantaneous': 'P_k native RHS(x*_1) vs P_k central difference'}[args.ode_target],
+        'native_scales': 'RMS training native tendency of the same target (64 training triplets)'})
     command = [
         'train', '--checkpoint', output / 'checkpoints' / 'baseline-init.pkl',
         '--train-data', args.train_data, '--validation-data', args.validation_data,
@@ -201,7 +205,7 @@ def concept_comparison(args):
         '--tendency-weight', 0, '--acceleration-weight', 0, '--residual-weight', 1e-6,
         '--ode-temperature-weight', weights['temperature'],
         '--ode-momentum-weight', weights['momentum'],
-        '--ode-moisture-weight', weights['moisture'],
+        '--ode-moisture-weight', weights['moisture'], '--ode-target', args.ode_target,
         '--scales', scales, '--output', destination]
     phase = 'failed'
     try:
@@ -300,6 +304,7 @@ def main(argv=None):
     concept.add_argument('--validation-data', type=Path, required=True)
     for group in ('temperature', 'momentum', 'moisture'):
         concept.add_argument(f'--ode-{group}-weight', type=float, required=True)
+    concept.add_argument('--ode-target', choices=['interval', 'instantaneous'], default='interval')
     concept.add_argument('--allow-cpu', action='store_true')
     concept.set_defaults(func=concept_comparison)
     test = phases.add_parser('test', help='evaluate selected models on held-out test once')

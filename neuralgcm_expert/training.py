@@ -35,6 +35,10 @@ class LossConfig:
     residual_parameter_weight: float = 1e-6
     # Per-concept intermediate ODE losses: lambda_k for temperature/momentum/moisture.
     ode_weights: Mapping[str, float] = field(default_factory=dict)
+    # 'interval': solver-integrated (core + learned) concept tendency over each
+    # output interval vs the encoded data; 'instantaneous': native RHS vs the
+    # central difference (only meaningful for short intervals, e.g. hourly data).
+    ode_target: str = 'interval'
 
     def __post_init__(self):
         for value in (self.tendency_weight, self.acceleration_weight,
@@ -43,6 +47,8 @@ class LossConfig:
                 raise ValueError("Loss weights must be finite and nonnegative")
         if set(self.ode_weights) - set(ODE_GROUPS):
             raise ValueError(f"ode_weights keys must be among {ODE_GROUPS}")
+        if self.ode_target not in ('interval', 'instantaneous'):
+            raise ValueError("ode_target must be 'interval' or 'instantaneous'")
 
     @property
     def uses_native(self):
@@ -149,10 +155,11 @@ def prepare_native_targets(model, dataset, output_interval, *, native_scales,
             raise ValueError('native_scales must contain finite positive values')
     return {'state': states[1], 'forcings': forcings[1],
             'tendency': state_fields(first), 'acceleration': state_fields(second),
+            'encoded': [state_fields(x) for x in (x0, x1, x2)],
             'scales': native_scales}
 
 
-def checkpointed_unroll(model, state, forcings, steps, output_interval):
+def checkpointed_unroll(model, state, forcings, steps, output_interval, return_states=False):
     """Same values as model.unroll, with each output interval rematerialized.
 
     The official unroll keeps every inner model step of the whole rollout for
@@ -161,19 +168,24 @@ def checkpointed_unroll(model, state, forcings, steps, output_interval):
     multi-step training at roughly the single-step footprint.
     """
     if steps == 1:
-        return model.unroll(state, forcings, steps=1, timedelta=output_interval,
-                            start_with_input=False)[1]
+        state, outputs = model.unroll(state, forcings, steps=1, timedelta=output_interval,
+                                      start_with_input=False)
+        return (outputs, [state.state]) if return_states else outputs
     advance = jax.checkpoint(lambda s: model.unroll(
         s, forcings, steps=1, timedelta=output_interval, start_with_input=False))
-    outputs = []
+    outputs, states = [], []
     for _ in range(steps):
         state, output = advance(state)
         outputs.append(output)
-    return jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *outputs)
+        states.append(state.state)
+    outputs = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *outputs)
+    return (outputs, states) if return_states else outputs
 
 
-def estimate_native_scales(model, dataset, output_interval, start_indices):
+def estimate_native_scales(model, dataset, output_interval, start_indices, target='interval'):
     """RMS of the data-derived native tendency per field, over training triplets only.
+
+    ``target`` matches the concept loss: one-interval difference or central difference.
 
     Native fields are modal coefficients in nondimensional units, so data-space
     scales do not apply; these fixed scales normalize each concept ODE loss.
@@ -184,8 +196,12 @@ def estimate_native_scales(model, dataset, output_interval, start_indices):
     sums, count = {}, 0
     for index in start_indices:
         triplet = dataset.sel(time=times[index] + np.arange(3)*interval)
-        tendency = prepare_native_targets(model, triplet, output_interval, native_scales=None,
-                                          validate_scales=False)['tendency']
+        native = prepare_native_targets(model, triplet, output_interval, native_scales=None,
+                                        validate_scales=False)
+        tendency = native['tendency']
+        if target == 'interval':
+            span = float(model.to_nondim_units(pd.Timedelta(output_interval).total_seconds(), 'second'))
+            tendency = jax.tree_util.tree_map(lambda a, b: (b-a)/span, *native['encoded'][:2])
         for name, value in floating_dynamic_fields(tendency).items():
             sums[name] = sums.get(name, 0.0) + float(jnp.mean(jnp.square(value)))
         count += 1
@@ -210,6 +226,12 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
             or forecast_steps < 1 or not np.isfinite(learning_rate) or learning_rate <= 0):
         raise ValueError("forecast_steps and learning_rate must be positive")
     use_native = loss_config.uses_native
+    concept = any(loss_config.ode_weights.values())
+    if concept and loss_config.ode_target == 'interval' and forecast_steps > 2:
+        raise ValueError('interval concept loss uses the encoded triplet: forecast_steps <= 2')
+    import pandas as pd
+    interval_nondim = float(model.to_nondim_units(
+        pd.Timedelta(output_interval).total_seconds(), 'second'))
     if use_native and not native_scales:
         raise ValueError("Supply native_scales to enable native ODE losses")
     if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 0:
@@ -230,8 +252,9 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
             params, mask)
         current = with_params(model, effective_params)
         initial = current.encode(batch['inputs'], batch['initial_forcings'])
-        prediction = checkpointed_unroll(current, initial, batch['forcings'],
-                                         forecast_steps, output_interval)
+        prediction, rolled = checkpointed_unroll(current, initial, batch['forcings'],
+                                                 forecast_steps, output_interval,
+                                                 return_states=True)
         prediction = {k: prediction[k] for k in variable_scales}
         target = {k: batch['targets'][k] for k in variable_scales}
         forecast = weighted_mse(prediction, target, variable_scales=variable_scales,
@@ -242,21 +265,33 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
         if use_native:
             from neuralgcm_expert.dynamics import native_rhs, native_acceleration
             native = batch['native']
-            if loss_config.tendency_weight or any(loss_config.ode_weights.values()):
+            instantaneous = loss_config.ode_target == 'instantaneous'
+            if loss_config.tendency_weight or (instantaneous and concept):
                 rhs = state_fields(native_rhs(current, native['state'], native['forcings']))
             if loss_config.tendency_weight:
                 tendency = weighted_mse(rhs, native['tendency'], variable_scales=native_scales)
-            if any(loss_config.ode_weights.values()):
+            if concept:
                 # Core + learned tendency of each concept vs the data-derived total
                 # tendency of the same fields; the supervised values enter the solver.
-                predicted = floating_dynamic_fields(rhs)
-                expected = floating_dynamic_fields(native['tendency'])
+                if instantaneous:
+                    pairs = [(floating_dynamic_fields(rhs),
+                              floating_dynamic_fields(native['tendency']))]
+                else:
+                    origin = floating_dynamic_fields(native['encoded'][0])
+                    pairs = []
+                    for j, x_hat in enumerate(rolled, start=1):
+                        span = j*interval_nondim
+                        x_hat = floating_dynamic_fields(state_fields(x_hat))
+                        x_ref = floating_dynamic_fields(native['encoded'][j])
+                        pairs.append(({n: (x_hat[n]-origin[n])/span for n in origin},
+                                      {n: (x_ref[n]-origin[n])/span for n in origin}))
                 for group, weight in loss_config.ode_weights.items():
-                    names = [n for n in predicted if ode_group(n) == group]
+                    names = [n for n in pairs[0][0] if ode_group(n) == group]
                     if weight and names:
-                        concept_losses[group] = weighted_mse(
+                        concept_losses[group] = sum(weighted_mse(
                             {n: predicted[n] for n in names}, {n: expected[n] for n in names},
                             variable_scales={n: native_scales[n] for n in names})
+                            for predicted, expected in pairs) / len(pairs)
             if loss_config.acceleration_weight:
                 acceleration = weighted_mse(
                     state_fields(native_acceleration(current, native['state'], native['forcings'])),
