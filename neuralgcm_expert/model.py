@@ -160,8 +160,11 @@ def convert_config(config: str, mode: Mode,
     if mode not in ("baseline", "memoryless", "experts"):
         raise ValueError(f"Unknown mode: {mode!r}")
     if mode == "baseline":
+        # Only value-preserving rematerialization may be added to the baseline.
+        if any(not b.endswith("ColumnTower.checkpoint_tower = True") for b in gin_bindings):
+            raise ValueError("baseline preserves the checkpoint exactly; only tower remat allowed")
         if gin_bindings:
-            raise ValueError("baseline preserves the checkpoint exactly; no Gin overrides allowed")
+            config += "\n# memory-only rematerialization\n" + "\n".join(gin_bindings)
         return config
     if keep_memory and mode != "experts":
         raise ValueError("keep_memory applies only to experts mode")

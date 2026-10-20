@@ -30,8 +30,6 @@ def initialize(args):
             raise ValueError('--no-residual applies only to experts')
         bindings.append('DecomposedNodalMapping.enable_residual = False')
     if args.remat_towers:
-        if args.mode == 'baseline':
-            raise ValueError('--remat-towers does not apply to the untouched baseline')
         # Recompute column towers in the backward pass: identical values, but five
         # expert towers otherwise store every column activation (~117 -> ~17 GiB).
         bindings.extend(f'{scope}/ColumnTower.checkpoint_tower = True'

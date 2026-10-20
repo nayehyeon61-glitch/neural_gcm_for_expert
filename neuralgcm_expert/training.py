@@ -126,6 +126,26 @@ def prepare_native_targets(model, dataset, output_interval, *, native_scales):
             'scales': native_scales}
 
 
+def checkpointed_unroll(model, state, forcings, steps, output_interval):
+    """Same values as model.unroll, with each output interval rematerialized.
+
+    The official unroll keeps every inner model step of the whole rollout for
+    the backward pass, so memory grows with the forecast length (one 24h step
+    on L40S fits; two do not). Saving only one state per output interval keeps
+    multi-step training at roughly the single-step footprint.
+    """
+    if steps == 1:
+        return model.unroll(state, forcings, steps=1, timedelta=output_interval,
+                            start_with_input=False)[1]
+    advance = jax.checkpoint(lambda s: model.unroll(
+        s, forcings, steps=1, timedelta=output_interval, start_with_input=False))
+    outputs = []
+    for _ in range(steps):
+        state, output = advance(state)
+        outputs.append(output)
+    return jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *outputs)
+
+
 def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
                     spatial_weights=None, loss_config=LossConfig(),
                     learning_rate=1e-4, scope='physics', native_scales=None,
@@ -159,9 +179,8 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
             params, mask)
         current = with_params(model, effective_params)
         initial = current.encode(batch['inputs'], batch['initial_forcings'])
-        _, prediction = current.unroll(initial, batch['forcings'],
-                                       steps=forecast_steps, timedelta=output_interval,
-                                       start_with_input=False)
+        prediction = checkpointed_unroll(current, initial, batch['forcings'],
+                                         forecast_steps, output_interval)
         prediction = {k: prediction[k] for k in variable_scales}
         target = {k: batch['targets'][k] for k in variable_scales}
         forecast = weighted_mse(prediction, target, variable_scales=variable_scales,

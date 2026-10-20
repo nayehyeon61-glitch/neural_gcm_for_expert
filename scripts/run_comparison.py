@@ -121,7 +121,8 @@ def train_comparison(args):
         'seed': args.seed, 'scope': 'physics', 'forcing_mode': 'persistence',
         'tendency_weight': 0.0, 'acceleration_weight': 0.0, 'residual_parameter_weight': 1e-6,
         'selection': 'pooled multi-initialization validation normalized forecast MSE',
-        'tower_remat': 'non-baseline modes (memory only; identical values)',
+        'tower_remat': 'all modes (memory only; identical values)',
+        'rollout_remat': 'one saved state per output interval when train_steps > 1 (identical values)',
         'expert_output_init': 'zero (expert and residual output layers)',
         'expert_native_memory': 'kept (official memory encoder and memory features)',
         'warmup_steps': args.warmup_steps,
@@ -129,10 +130,9 @@ def train_comparison(args):
     }
     save_json(output / 'protocol.json', protocol)
     for mode in modes:
-        remat = ['--remat-towers'] if mode != 'baseline' else []
         zero = ['--zero-expert-output', '--keep-memory'] if mode == 'experts' else []
         run_cli('init', '--mode', mode, '--checkpoint', args.checkpoint,
-                '--data', args.train_data, '--seed', args.seed, *remat, *zero,
+                '--data', args.train_data, '--seed', args.seed, '--remat-towers', *zero,
                 '--output', output / 'checkpoints' / f'{mode}-init.pkl')
     # The original model is fine-tuned first, providing ONE train-derived scale
     # file that every architecture uses, including validation model selection.
