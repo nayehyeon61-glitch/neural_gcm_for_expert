@@ -122,13 +122,16 @@ def train_comparison(args):
         'tendency_weight': 0.0, 'acceleration_weight': 0.0, 'residual_parameter_weight': 1e-6,
         'selection': 'pooled multi-initialization validation normalized forecast MSE',
         'tower_remat': 'non-baseline modes (memory only; identical values)',
+        'expert_output_init': 'zero (expert and residual output layers)',
+        'warmup_steps': args.warmup_steps,
         'comparison_scope': 'transfer-learning experiment; not matched pretraining or parameter budgets',
     }
     save_json(output / 'protocol.json', protocol)
     for mode in modes:
         remat = ['--remat-towers'] if mode != 'baseline' else []
+        zero = ['--zero-expert-output'] if mode == 'experts' else []
         run_cli('init', '--mode', mode, '--checkpoint', args.checkpoint,
-                '--data', args.train_data, '--seed', args.seed, *remat,
+                '--data', args.train_data, '--seed', args.seed, *remat, *zero,
                 '--output', output / 'checkpoints' / f'{mode}-init.pkl')
     # The original model is fine-tuned first, providing ONE train-derived scale
     # file that every architecture uses, including validation model selection.
@@ -142,6 +145,7 @@ def train_comparison(args):
             '--validation-stride', args.validation_stride,
             '--stride', args.train_stride, '--epochs', args.epochs,
             '--learning-rate', args.learning_rate, '--seed', args.seed,
+            '--warmup-steps', args.warmup_steps,
             '--scope', 'physics', '--forcing-mode', 'persistence',
             '--tendency-weight', 0, '--acceleration-weight', 0, '--residual-weight', 1e-6,
             '--output', output / label,
@@ -215,6 +219,8 @@ def main(argv=None):
     train.add_argument('--validation-stride', type=int, default=7)
     train.add_argument('--test-stride', type=int, default=1)
     train.add_argument('--learning-rate', type=float, default=1e-4)
+    train.add_argument('--warmup-steps', type=int, default=1000,
+                       help='linear warmup updates, shared by every arm')
     train.add_argument('--seed', type=int, default=0)
     train.add_argument('--include-memoryless', action='store_true')
     train.add_argument('--allow-cpu', action='store_true')

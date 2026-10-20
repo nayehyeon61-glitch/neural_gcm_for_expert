@@ -128,7 +128,8 @@ def prepare_native_targets(model, dataset, output_interval, *, native_scales):
 
 def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
                     spatial_weights=None, loss_config=LossConfig(),
-                    learning_rate=1e-4, scope='physics', native_scales=None):
+                    learning_rate=1e-4, scope='physics', native_scales=None,
+                    warmup_steps=0):
     """Return optimizer, state, and a jitted update using the real official solver.
 
     batch = {'inputs', 'initial_forcings', 'forcings', 'targets'} plus optional
@@ -140,10 +141,15 @@ def make_train_step(model, *, forecast_steps, output_interval, variable_scales,
     use_native = bool(loss_config.tendency_weight or loss_config.acceleration_weight)
     if use_native and not native_scales:
         raise ValueError("Supply native_scales to enable native ODE losses")
+    if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 0:
+        raise ValueError("warmup_steps must be a nonnegative integer")
     mask = trainable_mask(model.params, scope)
     labels = jax.tree_util.tree_map(lambda x: 'train' if x else 'freeze', mask)
+    # Linear warmup to a constant peak, as in NeuralGCM's own optimizer schedule.
+    schedule = (optax.linear_schedule(learning_rate / warmup_steps, learning_rate, warmup_steps)
+                if warmup_steps else learning_rate)
     optimizer = optax.multi_transform({
-        'train': optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate)),
+        'train': optax.chain(optax.clip_by_global_norm(1.0), optax.adam(schedule)),
         'freeze': optax.set_to_zero(),
     }, labels)
 

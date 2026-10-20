@@ -40,6 +40,21 @@ def initialize(args):
                             sample_inputs=reference.inputs_from_xarray(sample),
                             sample_forcings=reference.forcings_from_xarray(sample),
                             rng=jax.random.PRNGKey(args.seed), gin_bindings=bindings)
+    if args.zero_expert_output:
+        if args.mode != 'experts':
+            raise ValueError('--zero-expert-output applies only to experts')
+        from neuralgcm_expert.training import with_params
+        # Random expert heads blow up the rollout within ~24 h; zero output layers
+        # start from the dycore alone while hidden layers keep their random init.
+        zeroed = [name for name in model.params
+                  if 'decomposed_nodal_mapping' in name and 'decode_tower' in name]
+        if not zeroed:
+            raise ValueError('No expert output layers found to zero')
+        model = with_params(model, {
+            name: ({k: jax.numpy.zeros_like(v) for k, v in values.items()}
+                   if name in zeroed else values)
+            for name, values in model.params.items()})
+        model.expert_metadata['zeroed_output_layers'] = zeroed
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_checkpoint(model, output, checkpoint)
@@ -118,6 +133,7 @@ def train(args):
         variable_scales=variable_scales,
         spatial_weights=quadrature_weights(model.data_coords.horizontal),
         loss_config=config, learning_rate=args.learning_rate, scope=args.scope,
+        warmup_steps=getattr(args, 'warmup_steps', 0),
         native_scales=native_scales)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -224,6 +240,8 @@ def main(argv=None):
     init.add_argument('--output', required=True)
     init.add_argument('--mode', choices=['baseline', 'memoryless', 'experts'], default='experts')
     init.add_argument('--no-residual', action='store_true')
+    init.add_argument('--zero-expert-output', action='store_true',
+                      help='zero-initialize expert/residual output layers (stable start)')
     init.add_argument('--remat-towers', action='store_true',
                       help='rematerialize column towers (memory only; same values)')
     init.add_argument('--seed', type=int, default=0)
@@ -254,6 +272,8 @@ def main(argv=None):
     training.add_argument('--interval', default='6h')
     training.add_argument('--stride', type=int, default=1)
     training.add_argument('--learning-rate', type=float, default=1e-4)
+    training.add_argument('--warmup-steps', type=int, default=0,
+                          help='linear learning-rate warmup updates before the constant peak')
     training.add_argument('--scope', choices=['physics', 'all'], default='physics')
     training.add_argument('--scales', help='JSON: decoded variable name -> training normalization scale')
     training.add_argument('--native-scales', help='JSON: native field path -> positive nondimensional scale')
