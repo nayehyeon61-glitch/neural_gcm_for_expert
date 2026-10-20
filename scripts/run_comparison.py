@@ -138,27 +138,67 @@ def train_comparison(args):
     # The original model is fine-tuned first, providing ONE train-derived scale
     # file that every architecture uses, including validation model selection.
     for mode in modes:
-        label = 'baseline_finetuned' if mode == 'baseline' else mode
-        command = [
-            'train', '--checkpoint', output / 'checkpoints' / f'{mode}-init.pkl',
-            '--train-data', args.train_data, '--validation-data', args.validation_data,
-            '--steps', args.train_steps, '--interval', args.interval,
-            '--validation-steps', args.evaluation_steps,
-            '--validation-stride', args.validation_stride,
-            '--stride', args.train_stride, '--epochs', args.epochs,
-            '--learning-rate', args.learning_rate, '--seed', args.seed,
-            '--warmup-steps', args.warmup_steps,
-            '--scope', 'physics', '--forcing-mode', 'persistence',
-            '--tendency-weight', 0, '--acceleration-weight', 0, '--residual-weight', 1e-6,
-            '--output', output / label,
-        ]
-        if mode != 'baseline':
-            command.extend(['--scales', output / 'baseline_finetuned' / 'scales.json'])
-        run_cli(*command)
+        train_arm(output, protocol, mode)
     protocol['phase'] = 'trained'
     save_json(output / 'protocol.json', protocol)
     print(f'Train and validation complete. Review {output}/protocol.json and each '
           'validation-selection.json before the separate test command.', flush=True)
+
+
+def train_arm(output, protocol, mode):
+    label = 'baseline_finetuned' if mode == 'baseline' else mode
+    command = [
+        'train', '--checkpoint', output / 'checkpoints' / f'{mode}-init.pkl',
+        '--train-data', protocol['train']['path'],
+        '--validation-data', protocol['validation']['path'],
+        '--steps', protocol['train_steps'], '--interval', protocol['interval'],
+        '--validation-steps', protocol['evaluation_steps'],
+        '--validation-stride', protocol['validation_stride'],
+        '--stride', protocol['train_stride'], '--epochs', protocol['epochs'],
+        '--learning-rate', protocol['learning_rate'], '--seed', protocol['seed'],
+        '--warmup-steps', protocol['warmup_steps'],
+        '--scope', 'physics', '--forcing-mode', 'persistence',
+        '--tendency-weight', 0, '--acceleration-weight', 0, '--residual-weight', 1e-6,
+        '--output', output / label,
+    ]
+    if mode != 'baseline':
+        command.extend(['--scales', output / 'baseline_finetuned' / 'scales.json'])
+    run_cli(*command)
+
+
+def arm_complete(output, protocol, label):
+    selection = output / label / 'validation-selection.json'
+    return (selection.is_file() and (output / label / 'best.pkl').is_file() and
+            json.loads(selection.read_text())['epoch'] == protocol['epochs'])
+
+
+def resume_comparison(args):
+    """Finish the arms of an interrupted run with its frozen protocol and init checkpoints.
+
+    Completed arms are kept; a partially trained arm is archived and retrained
+    from its init checkpoint (training is not resumed mid-epoch).
+    """
+    check_backend(args.allow_cpu)
+    output = args.run.resolve()
+    protocol = json.loads((output / 'protocol.json').read_text())
+    if protocol['phase'] != 'training' or (output / 'test').exists():
+        raise ValueError('resume applies only to an interrupted, untested run')
+    for mode in protocol['modes']:
+        if not (output / 'checkpoints' / f'{mode}-init.pkl').is_file():
+            raise FileNotFoundError(output / 'checkpoints' / f'{mode}-init.pkl')
+    for mode in protocol['modes']:
+        label = 'baseline_finetuned' if mode == 'baseline' else mode
+        if arm_complete(output, protocol, label):
+            print(f'{label}: complete, kept', flush=True)
+            continue
+        partial = output / label
+        if partial.exists():
+            archive = output / f'{label}.interrupted-{time.strftime("%Y%m%d-%H%M%S")}'
+            partial.rename(archive)
+            print(f'{label}: partial run archived to {archive.name}', flush=True)
+        train_arm(output, protocol, mode)
+    protocol['phase'] = 'trained'
+    save_json(output / 'protocol.json', protocol)
 
 
 def concept_comparison(args):
@@ -298,6 +338,10 @@ def main(argv=None):
     train.add_argument('--include-memoryless', action='store_true')
     train.add_argument('--allow-cpu', action='store_true')
     train.set_defaults(func=train_comparison)
+    resume = phases.add_parser('resume', help='finish the arms of an interrupted run')
+    resume.add_argument('--run', type=Path, required=True)
+    resume.add_argument('--allow-cpu', action='store_true')
+    resume.set_defaults(func=resume_comparison)
     concept = phases.add_parser('concept', help='add the concept ODE-loss arm to a run')
     concept.add_argument('--run', type=Path, required=True)
     concept.add_argument('--train-data', type=Path, required=True)
