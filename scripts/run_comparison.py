@@ -99,6 +99,13 @@ def train_comparison(args):
     modes = ['baseline', 'experts']
     if args.include_memoryless:
         modes.insert(1, 'memoryless')
+    if args.arms:
+        # Subset of the transfer arms (e.g. baseline only, with concept arms added).
+        if args.scratch_width or not set(args.arms) <= {'baseline', 'memoryless', 'experts'}:
+            raise ValueError('--arms selects among baseline, memoryless and experts')
+        modes = [m for m in ('baseline', 'memoryless', 'experts') if m in args.arms]
+        if modes[0] != 'baseline':
+            raise ValueError('--arms must include baseline (it provides the shared scales)')
     if args.scratch_width:
         # Physics from scratch: a single wide network vs the experts, matched in size.
         # The untouched baseline is initialized only as the pretrained test reference.
@@ -421,6 +428,7 @@ def main(argv=None):
                        help='linear warmup updates, shared by every arm')
     train.add_argument('--seed', type=int, default=0)
     train.add_argument('--include-memoryless', action='store_true')
+    train.add_argument('--arms', nargs='+', help='transfer arms to set up (default: baseline experts)')
     train.add_argument('--init-only', action='store_true',
                        help='write protocol and init checkpoints; train arms with resume --mode')
     train.add_argument('--scratch-width', type=int,
