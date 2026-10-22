@@ -255,11 +255,15 @@ def concept_comparison(args):
     check_backend(args.allow_cpu)
     output = args.run.resolve()
     protocol = json.loads((output / 'protocol.json').read_text())
-    destination = output / 'concept'
+    # Extra named arms (e.g. a lambda ablation) may join after the test; they
+    # select on validation as usual and are tested on their own with test-arm.
+    name = args.name
+    destination = output / name
     if destination.exists():
         raise FileExistsError(f'{destination} already exists')
-    if (output / 'test').exists():
+    if name == 'concept' and (output / 'test').exists():
         raise ValueError('Test already ran; a new arm cannot join this run')
+    record = output / f'{name}_protocol.json'
     scales = output / 'baseline_finetuned' / 'scales.json'
     if not scales.is_file():
         raise FileNotFoundError(scales)
@@ -267,8 +271,8 @@ def concept_comparison(args):
                'moisture': args.ode_moisture_weight}
     if not all(np.isfinite(w) and w > 0 for w in weights.values()):
         raise ValueError('concept ODE weights must be finite and positive')
-    save_json(output / 'concept_protocol.json', {
-        'phase': 'training', 'base_protocol': protocol['repository_commit'],
+    save_json(record, {
+        'phase': 'training', 'name': name, 'base_protocol': protocol['repository_commit'],
         'init': 'checkpoints/baseline-init.pkl (official shared physics network)',
         'ode_weights': weights, 'ode_target': args.ode_target,
         'ode_target_definition': {
@@ -296,8 +300,7 @@ def concept_comparison(args):
         run_cli(*command)
         phase = 'trained'
     finally:
-        save_json(output / 'concept_protocol.json', {
-            **json.loads((output / 'concept_protocol.json').read_text()), 'phase': phase})
+        save_json(record, {**json.loads(record.read_text()), 'phase': phase})
 
 
 def test_comparison(args):
@@ -364,6 +367,40 @@ def test_comparison(args):
     print(f'Paired test results and improvement CSVs saved in {destination}', flush=True)
 
 
+def test_arm(args):
+    """Test one extra named arm against the arms already in the one-shot test."""
+    check_backend(args.allow_cpu)
+    output = args.run.resolve()
+    protocol = json.loads((output / 'protocol.json').read_text())
+    if protocol['phase'] != 'tested':
+        raise ValueError('test-arm needs the main one-shot test to have run')
+    if json.loads((output / f'{args.name}_protocol.json').read_text())['phase'] != 'trained':
+        raise ValueError(f'{args.name} has not finished training')
+    if args.test_data.resolve() != Path(protocol['test']['path']).resolve():
+        raise ValueError('Use the same test data as the main test')
+    tested = output / 'test'
+    destination = tested / args.name
+    if destination.exists():
+        raise FileExistsError(f'{destination} already exists; preserve existing test results')
+    checkpoint = output / args.name / 'best.pkl'
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    references = sorted(path.name for path in tested.iterdir()
+                        if path.is_dir() and (path / 'metrics.nc').is_file())
+    run_cli('evaluate', '--checkpoint', checkpoint, '--data', args.test_data,
+            '--steps', protocol['evaluation_steps'], '--interval', protocol['interval'],
+            '--all-starts', '--stride', protocol['test_stride'],
+            '--forcing-mode', protocol['forcing_mode'], '--output', destination)
+    comparison = Path(__file__).with_name('compare_metrics.py')
+    for baseline in references:
+        subprocess.run([
+            sys.executable, str(comparison), '--baseline', str(tested / baseline),
+            '--candidate', str(destination),
+            '--output', str(tested / f'{args.name}_vs_{baseline}.csv'),
+        ], check=True)
+    print(f'{args.name} test results saved in {destination}', flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     phases = parser.add_subparsers(dest='phase', required=True)
@@ -403,6 +440,8 @@ def main(argv=None):
     for group in ('temperature', 'momentum', 'moisture'):
         concept.add_argument(f'--ode-{group}-weight', type=float, required=True)
     concept.add_argument('--ode-target', choices=['interval', 'instantaneous'], default='interval')
+    concept.add_argument('--name', default='concept',
+                         help='arm directory; a non-default name may join after the test')
     concept.add_argument('--allow-cpu', action='store_true')
     concept.set_defaults(func=concept_comparison)
     test = phases.add_parser('test', help='evaluate selected models on held-out test once')
@@ -410,6 +449,12 @@ def main(argv=None):
     test.add_argument('--test-data', type=Path, required=True)
     test.add_argument('--allow-cpu', action='store_true')
     test.set_defaults(func=test_comparison)
+    extra = phases.add_parser('test-arm', help='test an extra named arm after the main test')
+    extra.add_argument('--run', type=Path, required=True)
+    extra.add_argument('--name', required=True)
+    extra.add_argument('--test-data', type=Path, required=True)
+    extra.add_argument('--allow-cpu', action='store_true')
+    extra.set_defaults(func=test_arm)
     args = parser.parse_args(argv)
     args.func(args)
 
